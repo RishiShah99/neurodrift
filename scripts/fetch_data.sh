@@ -23,16 +23,19 @@ usage() {
   cat <<EOF
 Usage: $0 [--cohorts list] [--scratch dir] [--bucket name] [--force]
 
-  --cohorts   Comma-sep subset of: ixi,openbhb,oasis3,hcp_d,hcp_a (default: all)
+  --cohorts   Comma-sep subset of: ixi,abide,openneuro,openbhb,oasis3,hcp_d,hcp_a
+              (default: ixi,abide,openneuro — v0 walk-up corpus)
   --scratch   Local scratch dir on the fleet box (default: /mnt/scratch/raw)
   --bucket    GCS bucket (default: \$GCS_BUCKET or neurodrift-data)
   --force     Re-download cohorts even if their GCS prefix is non-empty
 
 Env vars needed:
   GCS_BUCKET             target bucket (or pass --bucket)
-  IEEE_DATAPORT_TOKEN    OpenBHB
-  XNAT_USER, XNAT_PASS   OASIS-3
-  HCP_AWS_KEY, HCP_AWS_SECRET   HCP-Aging + HCP-Development
+  IEEE_DATAPORT_TOKEN    OpenBHB (deferred — DataPort signups currently flaky)
+  XNAT_USER, XNAT_PASS   OASIS-3 (v1 only)
+  HCP_AWS_KEY, HCP_AWS_SECRET   HCP-Aging + HCP-Development (v1 only)
+
+v0 default cohorts (ixi, abide, openneuro) require no credentials.
 EOF
 }
 
@@ -47,7 +50,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-COHORTS="${COHORTS:-ixi,openbhb,oasis3,hcp_d,hcp_a}"
+COHORTS="${COHORTS:-ixi,abide,openneuro}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$SCRATCH"

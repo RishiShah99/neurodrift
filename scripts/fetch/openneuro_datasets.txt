@@ -1,0 +1,19 @@
+# OpenNeuro lifespan / healthy T1 collections to pull as bulk substitute for OpenBHB.
+# Format: one dataset ID per non-comment line. # at line start = comment.
+# Fetched via openneuro-py with include=anat+dwi, exclude=func+meg+beh.
+#
+# To add a dataset: browse https://openneuro.org/datasets/ filtered by:
+#   - Modality: MR
+#   - Has T1w
+#   - Healthy adult / lifespan if possible
+# Verify the ID and append below.
+
+# Verified — Leipzig Mind-Brain-Body (LEMON). T1+T2+dMRI, ages 20–77, n=318.
+ds000221
+
+# Candidates worth verifying and adding (next session can drop these in after a quick
+# openneuro.org check — leaving commented so we don't pull anything we haven't confirmed):
+# ds002785   # NKI / Rockland-style — verify scope before fetch
+# ds003097   # Lifespan T1 — verify
+# ds004215   # Verify
+# ds000228   # MIT — children + adults, ~155
