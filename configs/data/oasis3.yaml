@@ -1,0 +1,12 @@
+# OASIS-3 dataset config (Phase 1 day-1 corpus).
+_target_: neurodrift.train.data_module.NiftiDataModule
+
+bids_root: ${oc.env:OASIS3_ROOT,/data/oasis3}
+work_dir: ${oc.env:NEURODRIFT_WORK,/data/work/oasis3}
+template: ${oc.env:MNI_TEMPLATE,/data/templates/MNI152_T1_1mm.nii.gz}
+
+modalities: [T1w]
+image_size: 128
+batch_size: 2
+num_workers: 4
+val_fraction: 0.05

@@ -1,0 +1,18 @@
+# Top-level Hydra config. `scripts/train.py` composes from here.
+defaults:
+  - _self_
+  - experiment: vae_phase1
+
+seed: 1337
+output_dir: ${oc.env:NEURODRIFT_OUT,./out}/${experiment_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+# Logger toggle. Set to false for unit-test fast_dev_run.
+log_to_wandb: true
+
+hydra:
+  run:
+    dir: ${output_dir}
+  sweep:
+    dir: ${oc.env:NEURODRIFT_OUT,./out}/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
