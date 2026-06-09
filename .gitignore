@@ -1,3 +1,7 @@
+# ---------- All markdown is local-only ----------
+# Plan / handoff / docs stay on disk for the next session to read; never pushed.
+*.md
+
 # ---------- Python ----------
 __pycache__/
 *.py[cod]
