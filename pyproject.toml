@@ -78,8 +78,8 @@ dev = [
 
 [project.urls]
 Homepage = "https://rishishah.me/neurodrift"
-Repository = "https://github.com/rishishah99/neurodrift"
-Issues = "https://github.com/rishishah99/neurodrift/issues"
+Repository = "https://github.com/RishiShah99/neurodrift"
+Issues = "https://github.com/RishiShah99/neurodrift/issues"
 
 [build-system]
 requires = ["hatchling>=1.25"]
