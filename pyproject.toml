@@ -42,8 +42,8 @@ gpu = [
   "diffusers>=0.30",
   "transformers>=4.45",
   "accelerate>=0.34",
-  "wandb>=0.18",
   "monai>=1.3",
+  "tensorboard>=2.18",
 ]
 
 # Medical imaging tooling. antspyx wheels are unreliable on Windows; gate to Linux/Mac.
@@ -133,7 +133,6 @@ module = [
   "antspyx.*",
   "gsplat.*",
   "diffusers.*",
-  "wandb.*",
   "zarr.*",
   "SimpleITK.*",
   "pydicom.*",

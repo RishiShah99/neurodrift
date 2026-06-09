@@ -6,8 +6,8 @@ defaults:
 seed: 1337
 output_dir: ${oc.env:NEURODRIFT_OUT,./out}/${experiment_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-# Logger toggle. Set to false for unit-test fast_dev_run.
-log_to_wandb: true
+# Local TensorBoard logging. Set false for unit-test fast_dev_run.
+log_to_tensorboard: true
 
 hydra:
   run:

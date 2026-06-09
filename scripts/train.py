@@ -55,13 +55,13 @@ def main(cfg: DictConfig) -> None:
     ]
 
     logger: L.pytorch.loggers.Logger | bool
-    if cfg.log_to_wandb and not cfg.trainer.get("fast_dev_run", False):
-        logger = L.pytorch.loggers.WandbLogger(
-            project="neurodrift",
-            name=cfg.experiment_name,
+    if cfg.log_to_tensorboard and not cfg.trainer.get("fast_dev_run", False):
+        logger = L.pytorch.loggers.TensorBoardLogger(
             save_dir=str(output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
+            name="tb",
+            default_hp_metric=False,
         )
+        logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))  # type: ignore[arg-type]
     else:
         logger = False
 
