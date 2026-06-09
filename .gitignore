@@ -1,0 +1,103 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.Python
+pip-wheel-metadata/
+
+# uv / virtualenvs
+.venv/
+.uv/
+.python-version
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ---------- Node / Next.js ----------
+node_modules/
+.next/
+out/
+.turbo/
+.vercel/
+*.tsbuildinfo
+.next-env.d.ts
+pnpm-debug.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---------- ML / data ----------
+# Raw datasets — never committed
+data/raw/
+data/cache/
+data/zarr/
+data/derivatives/
+
+# Heavy formats
+*.nii
+*.nii.gz
+*.mgz
+*.dcm
+*.zarr/
+*.zip
+*.tar
+*.tar.gz
+
+# Checkpoints / weights
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+checkpoints/
+out/
+runs/
+
+# ---------- Experiment trackers ----------
+wandb/
+mlruns/
+lightning_logs/
+
+# ---------- Cloud / infra ----------
+.modal/
+.aws/
+.terraform/
+*.tfstate*
+
+# ---------- Secrets ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+
+# ---------- IDE / OS ----------
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Misc ----------
+*.log
+tmp/
+scratch/
