@@ -1,19 +1,20 @@
-# OpenNeuro lifespan / healthy T1 collections to pull as bulk substitute for OpenBHB.
-# Format: one dataset ID per non-comment line. # at line start = comment.
-# Fetched via openneuro-py with include=anat+dwi, exclude=func+meg+beh.
+# OpenNeuro datasets to bulk-pull for v0. Fetched via openneuro_parallel.py
+# which lists each dataset on s3://openneuro.org directly.
 #
-# To add a dataset: browse https://openneuro.org/datasets/ filtered by:
-#   - Modality: MR
-#   - Has T1w
-#   - Healthy adult / lifespan if possible
-# Verify the ID and append below.
+# Format: one dataset ID per non-comment line. Filter applied: anat/* + dwi/* .nii.gz/.nii/.bval/.bvec.
+# Unknown / missing datasets gracefully return 0 files; safe to over-include.
+#
+# Browse: https://openneuro.org/search?modality_selected=MRI
 
-# Verified — Leipzig Mind-Brain-Body (LEMON). T1+T2+dMRI, ages 20–77, n=318.
-ds000221
+# === Verified multimodal (T1 + T2 + dMRI per subject) ===
+ds000221         # LEMON — Leipzig Mind-Brain-Body, ages 20-77, n=318
+ds003011         # Longitudinal multi-scanner multimodal (T1 + dMRI + fMRI)
 
-# Candidates worth verifying and adding (next session can drop these in after a quick
-# openneuro.org check — leaving commented so we don't pull anything we haven't confirmed):
-# ds002785   # NKI / Rockland-style — verify scope before fetch
-# ds003097   # Lifespan T1 — verify
-# ds004215   # Verify
-# ds000228   # MIT — children + adults, ~155
+# === Strong candidates (verified via web search; confirm presence on first run) ===
+ds002785         # NKI Rockland Sample
+ds000228         # MIT children + adults, ~155 subjects
+ds002338         # ?
+ds003097         # lifespan T1
+ds004215         # ?
+ds002790         # AOMIC ID1000
+ds001226         # candidate

@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# IXI — fully public, direct HTTP from brain-development.org.
-# Five archives: T1, T2, PD, MRA, DTI. Untar in place.
+# IXI — public, hosted on the Imperial College brain-development mirror.
+# Five archives: T1, T2, PD, MRA, DTI. Each is downloaded, extracted, and
+# pushed to GCS as its own unit before the next one starts — preemption only
+# loses the in-flight archive.
 #
-# Driver provides: $COHORT_DIR (where to write).
+# Driver provides: COHORT_DIR, GCS_RAW, FORCE.
 
 set -euo pipefail
 
 cd "${COHORT_DIR:?missing COHORT_DIR}"
 
-BASE="https://brain-development.org/ixi-dataset/IXI-Dataset"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_lib.sh
+source "${SCRIPT_DIR}/_lib.sh"
+
+BASE="https://biomedic.doc.ic.ac.uk/brain-development/downloads/IXI"
 ARCHIVES=(
   "IXI-T1.tar"
   "IXI-T2.tar"
@@ -18,17 +24,22 @@ ARCHIVES=(
 )
 
 for tar in "${ARCHIVES[@]}"; do
-  if [[ -f ".done.${tar}" ]]; then
-    echo "skip $tar"
+  unit="${tar%.tar}"
+  if gcs_unit_done "$unit"; then
+    echo "skip $tar (already in GCS)"
     continue
   fi
+
   echo "fetching $tar"
-  curl -fsSLO --retry 5 --retry-delay 10 "${BASE}/${tar}"
+  curl -fSL --retry 5 --retry-delay 10 -o "$tar" "${BASE}/${tar}"
+
   echo "extracting $tar"
-  mkdir -p "${tar%.tar}"
-  tar -xf "$tar" -C "${tar%.tar}"
+  rm -rf "$unit"
+  mkdir -p "$unit"
+  tar -xf "$tar" -C "$unit"
   rm "$tar"
-  touch ".done.${tar}"
+
+  upload_unit "$unit" "$unit" "$unit"
 done
 
-echo "ixi: ready in ${COHORT_DIR}"
+echo "ixi: all archives in ${GCS_RAW}"

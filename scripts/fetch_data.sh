@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
-# Driver: download brain-MRI cohorts from each source's CDN straight to GCS.
+# Driver: dispatch per-cohort fetchers that incrementally push to GCS.
 #
-# Run on the fleet box, not locally:
+# Each cohort fetcher uploads its own data in small units (per archive, per
+# site, per dataset) and writes `.done.<unit>` sentinels into the cohort's
+# GCS prefix. That way a spot-preempted fetch resumes from the last
+# completed unit instead of restarting the whole cohort.
+#
+# Run on the fleet box:
 #   fleet up h100
 #   fleet sync
-#   fleet train "bash scripts/fetch_data.sh --cohorts ixi,openbhb,oasis3,hcp_d,hcp_a"
+#   fleet train "SCRATCH=\$HOME/scratch bash scripts/fetch_data.sh"
 #   fleet logs -f
-#
-# Per cohort: download to a scratch dir on the box, push to GCS, clear the
-# scratch dir, move on. Idempotent — re-runs skip cohorts whose GCS prefix
-# already has data.
 
 set -euo pipefail
 
 # ---------- defaults ----------
 GCS_BUCKET="${GCS_BUCKET:-neurodrift-data}"
-SCRATCH="${SCRATCH:-/mnt/scratch/raw}"
+SCRATCH="${SCRATCH:-$HOME/scratch}"
 COHORTS=""
 FORCE=0
 
@@ -25,17 +26,12 @@ Usage: $0 [--cohorts list] [--scratch dir] [--bucket name] [--force]
 
   --cohorts   Comma-sep subset of: ixi,abide,openneuro,openbhb,oasis3,hcp_d,hcp_a
               (default: ixi,abide,openneuro — v0 walk-up corpus)
-  --scratch   Local scratch dir on the fleet box (default: /mnt/scratch/raw)
+  --scratch   Local scratch dir on the fleet box (default: \$HOME/scratch)
   --bucket    GCS bucket (default: \$GCS_BUCKET or neurodrift-data)
-  --force     Re-download cohorts even if their GCS prefix is non-empty
+  --force     Re-upload units even if their GCS .done sentinel exists
 
-Env vars needed:
-  GCS_BUCKET             target bucket (or pass --bucket)
-  IEEE_DATAPORT_TOKEN    OpenBHB (deferred — DataPort signups currently flaky)
-  XNAT_USER, XNAT_PASS   OASIS-3 (v1 only)
-  HCP_AWS_KEY, HCP_AWS_SECRET   HCP-Aging + HCP-Development (v1 only)
-
-v0 default cohorts (ixi, abide, openneuro) require no credentials.
+Each fetcher checkpoints per unit into gs://\$GCS_BUCKET/raw/<cohort>/
+so a spot preemption only loses the in-flight unit.
 EOF
 }
 
@@ -50,49 +46,62 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-COHORTS="${COHORTS:-ixi,abide,openneuro}"
+# IXI off the default path: brain-development.org mirror is 403, HF mirror is
+# T1-only. LEMON (ds000221, pulled via openneuro) now supplies multimodal.
+COHORTS="${COHORTS:-abide,openneuro}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$SCRATCH"
 
-# ---------- helpers ----------
 log() { printf '[fetch_data %s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 
-gcs_has_data() {
-  local cohort="$1"
-  local count
-  count=$(gcloud storage ls "gs://${GCS_BUCKET}/raw/${cohort}/**" 2>/dev/null | head -1 | wc -l)
-  [[ "$count" -gt 0 ]]
+bootstrap_tooling() {
+  # Bare GCP image: python3 + gcloud only. Bring in pip + aws + openneuro-py.
+  if ! command -v pip >/dev/null && ! python3 -m pip --version >/dev/null 2>&1; then
+    log "installing python3-pip"
+    sudo apt-get update -qq && sudo apt-get install -y -qq python3-pip
+  fi
+  if ! python3 -c "import boto3, google.cloud.storage" >/dev/null 2>&1; then
+    log "installing boto3 + google-cloud-storage"
+    python3 -m pip install --quiet --user --break-system-packages \
+      boto3 google-cloud-storage
+  fi
+  if ! python3 -c "import openneuro" >/dev/null 2>&1; then
+    log "installing openneuro-py"
+    python3 -m pip install --quiet --user --break-system-packages openneuro-py
+  fi
+  export PATH="$HOME/.local/bin:$PATH"
 }
+
+bootstrap_tooling
 
 run_cohort() {
   local cohort="$1"
   local fetcher="${SCRIPT_DIR}/fetch/${cohort}.sh"
-  if [[ ! -x "$fetcher" ]]; then
+  if [[ ! -f "$fetcher" ]]; then
     log "ERROR: no fetcher at $fetcher"
     return 1
   fi
-  if (( FORCE == 0 )) && gcs_has_data "$cohort"; then
-    log "skip $cohort — gs://${GCS_BUCKET}/raw/${cohort}/ already populated (use --force to redo)"
-    return 0
-  fi
 
-  log "==== $cohort: download → GCS ===="
+  log "==== $cohort: per-unit fetch + GCS checkpoint ===="
   local local_dir="${SCRATCH}/${cohort}"
   mkdir -p "$local_dir"
 
+  local rc=0
   GCS_BUCKET="$GCS_BUCKET" \
+  COHORT="$cohort" \
   COHORT_DIR="$local_dir" \
-  bash "$fetcher"
-
-  log "uploading $cohort to gs://${GCS_BUCKET}/raw/${cohort}/"
-  gcloud storage cp --recursive --gzip-in-flight-all \
-    "${local_dir}/" \
-    "gs://${GCS_BUCKET}/raw/${cohort}/"
+  GCS_RAW="gs://${GCS_BUCKET}/raw/${cohort}" \
+  FORCE="$FORCE" \
+  bash "$fetcher" || rc=$?
 
   log "clearing scratch ${local_dir}"
   rm -rf "$local_dir"
-  log "done $cohort"
+  if (( rc != 0 )); then
+    log "WARN: $cohort exited rc=$rc — moving on"
+  else
+    log "done $cohort"
+  fi
 }
 
 # ---------- main ----------

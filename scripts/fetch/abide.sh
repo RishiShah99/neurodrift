@@ -1,36 +1,13 @@
 #!/usr/bin/env bash
-# ABIDE I + II — public, no signup. Hosted on NITRC + Amazon Public Datasets.
-# https://fcon_1000.projects.nitrc.org/indi/abide/
+# ABIDE I + II T1w — public AWS Open Data. Delegates to abide_parallel.py
+# which runs a threaded boto3 → google-cloud-storage pipeline. Resumable via
+# per-object .done.<unit> markers in GCS.
 #
-# We pull preprocessed T1 (CPAC pipeline) which is what brain-MRI groups
-# typically use. Skip the rs-fMRI to save bandwidth.
-#
-# Driver provides: $COHORT_DIR.
+# Driver provides: COHORT_DIR, GCS_RAW, GCS_BUCKET, FORCE.
 
 set -euo pipefail
 cd "${COHORT_DIR:?missing COHORT_DIR}"
 
-if ! command -v aws >/dev/null; then
-  pip install --quiet awscli
-fi
-
-# ABIDE is on the AWS Open Data registry as a public bucket — no creds needed.
-ABIDE_I="s3://fcp-indi/data/Projects/ABIDE_Initiative/Outputs/cpac/filt_noglobal/func_preproc/"
-ABIDE_I_T1="s3://fcp-indi/data/Projects/ABIDE_Initiative/Outputs/cpac/nofilt_noglobal/anat/"
-ABIDE_II="s3://fcp-indi/data/Projects/ABIDE_II/Outputs/cpac/nofilt_noglobal/anat/"
-
-mkdir -p abide_i abide_ii
-
-echo "syncing ABIDE I anat (T1) from public AWS bucket"
-aws s3 sync --no-sign-request \
-  "$ABIDE_I_T1" ./abide_i/ \
-  --exclude "*" --include "*_T1w*" \
-  --only-show-errors
-
-echo "syncing ABIDE II anat (T1)"
-aws s3 sync --no-sign-request \
-  "$ABIDE_II" ./abide_ii/ \
-  --exclude "*" --include "*_T1w*" \
-  --only-show-errors
-
-echo "abide: ready in ${COHORT_DIR}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export GCS_BUCKET GCS_RAW FORCE WORKERS="${WORKERS:-128}"
+exec python3 "${SCRIPT_DIR}/abide_parallel.py"
