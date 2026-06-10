@@ -82,6 +82,7 @@ lightning_logs/
 .aws/
 .terraform/
 *.tfstate*
+.fleet.json
 
 # ---------- Secrets ----------
 .env
@@ -90,6 +91,7 @@ lightning_logs/
 *.pem
 *.key
 secrets.yaml
+.gcp_adc.json
 
 # ---------- IDE / OS ----------
 .idea/
