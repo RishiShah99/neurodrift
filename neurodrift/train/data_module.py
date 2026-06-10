@@ -1,76 +1,301 @@
 """Lightning DataModule over preprocessed Zarr volumes.
 
-Phase 0 placeholder: emits random tensors at the configured resolution so the
-trainer scaffold can run before any real data lands. Phase 1 will swap this
-for a Zarr-backed dataset using `neurodrift.data.io.zarr_to_array`.
+Reads the v0 corpus from `${zarr_root}/${cohort}/<stem>.zarr`, groups Zarr
+stores by (cohort, subject, session) so a single batch sees all modalities
+that exist for one scan, applies modality dropout, and emits:
+
+    {
+        "image":         (B, M, D, H, W) tensor — zero-filled for dropped slots
+        "modality_mask": (B, M) float tensor — 1 = present, 0 = dropped/missing
+        "age":           (B,)  float tensor (NaN if unknown)
+        "cohort":        list[str] of length B
+    }
+
+The order of modality slots is fixed by `modalities` so the VAE's per-modality
+stems line up with the right channel.
 """
 
 from __future__ import annotations
 
+import random
+import re
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import lightning as L
+import numpy as np
 import torch
+import zarr
 from torch.utils.data import DataLoader, Dataset
 
-
-class _RandomVolumes(Dataset[dict[str, torch.Tensor]]):
-    def __init__(self, n: int, image_size: int, modalities: int) -> None:
-        self.n = n
-        self.image_size = image_size
-        self.modalities = modalities
-
-    def __len__(self) -> int:
-        return self.n
-
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        x = torch.randn(self.modalities, self.image_size, self.image_size, self.image_size)
-        return {"image": x, "age": torch.tensor(60.0)}
+_STEM_RE = re.compile(
+    r"^(?P<subject>sub-[^_]+)(?:_(?P<session>ses-[^_]+))?_(?P<modality>[A-Za-z0-9]+)$"
+)
 
 
-class NiftiDataModule(L.LightningDataModule):
-    """Stand-in DataModule. Replace with a Zarr-backed dataset once data lands."""
+@dataclass(frozen=True)
+class ScanRef:
+    cohort: str
+    subject: str
+    session: str | None
+    modality: str
+    url: str
+
+
+@dataclass(frozen=True)
+class SubjectGroup:
+    cohort: str
+    subject: str
+    session: str | None
+    scans_by_modality: dict[str, str]  # modality -> zarr url
+
+
+def _list_zarr_stems(root: str, cohort: str) -> list[ScanRef]:
+    """List every `<stem>.zarr` directly under `${root}/${cohort}/`.
+
+    Works for `gs://` (via gcsfs) and local paths (via os).
+    """
+    import fsspec
+
+    base = f"{root.rstrip('/')}/{cohort}"
+    fs, base_path = fsspec.core.url_to_fs(base)
+    refs: list[ScanRef] = []
+    try:
+        entries = fs.ls(base_path, detail=False)
+    except FileNotFoundError:
+        return refs
+    for entry in entries:
+        name = entry.rsplit("/", 1)[-1]
+        if not name.endswith(".zarr"):
+            continue
+        stem = name[: -len(".zarr")]
+        m = _STEM_RE.match(stem)
+        if m is None:
+            continue
+        protocol = fs.protocol if isinstance(fs.protocol, str) else fs.protocol[0]
+        url = entry if protocol == "file" else f"{protocol}://{entry}"
+        refs.append(
+            ScanRef(
+                cohort=cohort,
+                subject=m["subject"],
+                session=m["session"],
+                modality=m["modality"],
+                url=url,
+            )
+        )
+    return refs
+
+
+def _group_by_subject(refs: Sequence[ScanRef]) -> list[SubjectGroup]:
+    grouped: dict[tuple[str, str, str | None], dict[str, str]] = defaultdict(dict)
+    for r in refs:
+        grouped[(r.cohort, r.subject, r.session)][r.modality] = r.url
+    return [
+        SubjectGroup(cohort=c, subject=s, session=sess, scans_by_modality=mods)
+        for (c, s, sess), mods in grouped.items()
+    ]
+
+
+def _random_crop_or_pad(volume: np.ndarray, size: int, rng: random.Random) -> np.ndarray:
+    """Random crop to (size, size, size); pad with zeros where smaller."""
+    out = np.zeros((size, size, size), dtype=np.float32)
+    src = volume
+    src_shape = src.shape
+    src_starts = []
+    out_starts = []
+    extents = []
+    for s in src_shape:
+        if s >= size:
+            start = rng.randint(0, s - size)
+            src_starts.append(start)
+            out_starts.append(0)
+            extents.append(size)
+        else:
+            src_starts.append(0)
+            out_starts.append((size - s) // 2)
+            extents.append(s)
+    sl_src = tuple(slice(a, a + e) for a, e in zip(src_starts, extents, strict=True))
+    sl_out = tuple(slice(a, a + e) for a, e in zip(out_starts, extents, strict=True))
+    out[sl_out] = src[sl_src].astype(np.float32, copy=False)
+    return out
+
+
+def _zscore(x: np.ndarray) -> np.ndarray:
+    nonzero = x[x > 0]
+    if nonzero.size < 100:
+        return x
+    mu = float(nonzero.mean())
+    sd = float(nonzero.std() + 1e-6)
+    return (x - mu) / sd
+
+
+class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
+    """Yield one subject per index: stack present modalities into (M, D, H, W)."""
 
     def __init__(
         self,
-        bids_root: str,
-        work_dir: str,
-        template: str,
-        modalities: list[str] = ("T1w",),
+        groups: Sequence[SubjectGroup],
+        modalities: Sequence[str],
+        image_size: int,
+        modality_dropout_p: float = 0.3,
+        train: bool = True,
+        seed: int = 1337,
+    ) -> None:
+        self.groups = list(groups)
+        self.modalities = list(modalities)
+        self.image_size = image_size
+        self.modality_dropout_p = modality_dropout_p
+        self.train = train
+        self._seed = seed
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def _load_volume(self, url: str) -> np.ndarray:
+        root = zarr.open(url, mode="r")
+        return np.asarray(root["data"], dtype=np.float32)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        group = self.groups[idx]
+        rng = random.Random(self._seed + idx if not self.train else None)
+
+        m = len(self.modalities)
+        image = np.zeros((m, self.image_size, self.image_size, self.image_size), dtype=np.float32)
+        present_mask = np.zeros(m, dtype=np.float32)
+
+        for i, modality in enumerate(self.modalities):
+            url = group.scans_by_modality.get(modality)
+            if url is None:
+                continue
+            vol = self._load_volume(url)
+            vol = _random_crop_or_pad(vol, self.image_size, rng)
+            image[i] = _zscore(vol)
+            present_mask[i] = 1.0
+
+        retain_mask = present_mask.copy()
+        if self.train and self.modality_dropout_p > 0:
+            for i in range(m):
+                if retain_mask[i] == 1.0 and rng.random() < self.modality_dropout_p:
+                    retain_mask[i] = 0.0
+            if retain_mask.sum() == 0 and present_mask.sum() > 0:
+                kept = rng.choice([i for i in range(m) if present_mask[i] == 1.0])
+                retain_mask[kept] = 1.0
+
+        for i in range(m):
+            if retain_mask[i] == 0.0:
+                image[i] = 0.0
+
+        return {
+            "image": torch.from_numpy(image),
+            "modality_mask": torch.from_numpy(retain_mask),
+            "present_mask": torch.from_numpy(present_mask),
+            "cohort": group.cohort,
+            "subject": group.subject,
+            "session": group.session or "",
+        }
+
+
+def _collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    batch: dict[str, Any] = {
+        "image": torch.stack([s["image"] for s in samples]),
+        "modality_mask": torch.stack([s["modality_mask"] for s in samples]),
+        "present_mask": torch.stack([s["present_mask"] for s in samples]),
+        "cohort": [s["cohort"] for s in samples],
+        "subject": [s["subject"] for s in samples],
+        "session": [s["session"] for s in samples],
+    }
+    return batch
+
+
+class ZarrMultimodalDataModule(L.LightningDataModule):
+    """v0 multimodal datamodule. Walks `${zarr_root}/${cohort}/` for every cohort."""
+
+    def __init__(
+        self,
+        zarr_root: str,
+        cohorts: Sequence[str],
+        modalities: Sequence[str] = ("T1w", "T2w", "PDw", "dwi"),
         image_size: int = 128,
         batch_size: int = 2,
         num_workers: int = 4,
         val_fraction: float = 0.05,
+        modality_dropout_p: float = 0.3,
+        seed: int = 1337,
         **_: Any,
     ) -> None:
         super().__init__()
-        self.bids_root = bids_root
-        self.work_dir = work_dir
-        self.template = template
+        self.zarr_root = zarr_root
+        self.cohorts = list(cohorts)
         self.modalities = list(modalities)
         self.image_size = image_size
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.val_fraction = val_fraction
+        self.modality_dropout_p = modality_dropout_p
+        self.seed = seed
+        self.train_ds: ZarrMultimodalDataset | None = None
+        self.val_ds: ZarrMultimodalDataset | None = None
+
+    def _discover(self) -> list[SubjectGroup]:
+        refs: list[ScanRef] = []
+        for cohort in self.cohorts:
+            refs.extend(_list_zarr_stems(self.zarr_root, cohort))
+        return _group_by_subject(refs)
 
     def setup(self, stage: str | None = None) -> None:
-        n_train = 16
-        n_val = max(2, int(n_train * self.val_fraction * 10))
-        self.train_ds = _RandomVolumes(n_train, self.image_size, len(self.modalities))
-        self.val_ds = _RandomVolumes(n_val, self.image_size, len(self.modalities))
+        groups = self._discover()
+        if not groups:
+            raise RuntimeError(
+                f"no zarr stores found under {self.zarr_root} for cohorts {self.cohorts}; "
+                "run scripts/preprocess.py first"
+            )
+        rng = random.Random(self.seed)
+        rng.shuffle(groups)
+        n_val = max(1, int(len(groups) * self.val_fraction))
+        val_groups = groups[:n_val]
+        train_groups = groups[n_val:]
+        self.train_ds = ZarrMultimodalDataset(
+            train_groups,
+            self.modalities,
+            self.image_size,
+            self.modality_dropout_p,
+            train=True,
+            seed=self.seed,
+        )
+        self.val_ds = ZarrMultimodalDataset(
+            val_groups,
+            self.modalities,
+            self.image_size,
+            modality_dropout_p=0.0,
+            train=False,
+            seed=self.seed,
+        )
 
-    def train_dataloader(self) -> DataLoader[dict[str, torch.Tensor]]:
+    def train_dataloader(self) -> DataLoader[dict[str, Any]]:
+        assert self.train_ds is not None
         return DataLoader(
             self.train_ds,
             batch_size=self.batch_size,
             shuffle=True,
-            num_workers=0,
+            num_workers=self.num_workers,
+            collate_fn=_collate,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
         )
 
-    def val_dataloader(self) -> DataLoader[dict[str, torch.Tensor]]:
+    def val_dataloader(self) -> DataLoader[dict[str, Any]]:
+        assert self.val_ds is not None
         return DataLoader(
             self.val_ds,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=0,
+            num_workers=self.num_workers,
+            collate_fn=_collate,
+            pin_memory=True,
+            persistent_workers=self.num_workers > 0,
         )
+
+
+NiftiDataModule = ZarrMultimodalDataModule

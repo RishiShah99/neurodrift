@@ -1,9 +1,9 @@
-# Multimodal 3D VAE — Phase 1.
+# Multimodal 3D VAE — v0 Phase 1.
 _target_: neurodrift.models.vae3d.VAE3D
 
-in_channels: 1
+modalities: [T1w, T2w, PDw, dwi]
 latent_channels: 16
 base_channels: 64
-channel_mults: [1, 2, 4, 4]
+channel_mults: [1, 2, 4]
 num_res_blocks: 2
 beta_kl: 1.0e-4

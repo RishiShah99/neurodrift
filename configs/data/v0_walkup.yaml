@@ -1,8 +1,8 @@
-# OASIS-3 — v1 gated cohort. Reads from the same Zarr layout as v0.
+# v0 walk-up corpus: IXI + ABIDE + OpenNeuro bulk (Zarr cache in GCS).
 _target_: neurodrift.train.data_module.ZarrMultimodalDataModule
 
 zarr_root: ${oc.env:NEURODRIFT_ZARR_ROOT,gs://neurodrift-data/zarr}
-cohorts: [oasis3]
+cohorts: [ixi, abide, openneuro]
 modalities: [T1w, T2w, PDw, dwi]
 image_size: 128
 batch_size: 2
