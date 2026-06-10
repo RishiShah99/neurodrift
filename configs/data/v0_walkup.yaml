@@ -1,9 +1,13 @@
-# v0 walk-up corpus: IXI + ABIDE + OpenNeuro bulk (Zarr cache in GCS).
+# v0 walk-up corpus: ABIDE + OpenNeuro bulk (Zarr cache in GCS).
+# Corpus reality (verified against the bucket 2026-06-10): IXI never landed,
+# and no PDw/dwi exist. ABIDE is 1101 T1w-only; OpenNeuro is 976 subject-sessions
+# of which 225 are full trimodal T1w/T2w/FLAIR (+82 bimodal) — enough cross-modal
+# cycle signal. Slots match configs/model/vae3d.yaml exactly.
 _target_: neurodrift.train.data_module.ZarrMultimodalDataModule
 
 zarr_root: ${oc.env:NEURODRIFT_ZARR_ROOT,gs://neurodrift-data/zarr}
-cohorts: [ixi, abide, openneuro]
-modalities: [T1w, T2w, PDw, dwi]
+cohorts: [abide, openneuro]
+modalities: [T1w, T2w, FLAIR]
 image_size: 128
 batch_size: 2
 num_workers: 4
