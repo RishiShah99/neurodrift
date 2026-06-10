@@ -273,29 +273,28 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
             seed=self.seed,
         )
 
+    def _loader_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "collate_fn": _collate,
+            "pin_memory": True,
+            "persistent_workers": self.num_workers > 0,
+        }
+        # gcsfs opens a gs:// store via an asyncio loop + background thread that
+        # do not survive a fork; forked workers crash on the first zarr.open.
+        # Spawned workers start clean and build their own loop per process.
+        if self.num_workers > 0:
+            kwargs["multiprocessing_context"] = "spawn"
+        return kwargs
+
     def train_dataloader(self) -> DataLoader[dict[str, Any]]:
         assert self.train_ds is not None
-        return DataLoader(
-            self.train_ds,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            collate_fn=_collate,
-            pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-        )
+        return DataLoader(self.train_ds, shuffle=True, **self._loader_kwargs())
 
     def val_dataloader(self) -> DataLoader[dict[str, Any]]:
         assert self.val_ds is not None
-        return DataLoader(
-            self.val_ds,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            collate_fn=_collate,
-            pin_memory=True,
-            persistent_workers=self.num_workers > 0,
-        )
+        return DataLoader(self.val_ds, shuffle=False, **self._loader_kwargs())
 
 
 NiftiDataModule = ZarrMultimodalDataModule
