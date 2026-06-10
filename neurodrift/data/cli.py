@@ -1,31 +1,27 @@
-"""Thin subprocess wrappers around the external imaging CLIs.
+"""In-process imaging primitives backed by the antspyx / antspynet Python APIs.
 
-Each wrapper is a single function with a typed signature. Tests monkey-patch
-these functions to passthrough-copy the input so the pipeline can run end-to-end
-on a CPU laptop with no Freesurfer / ANTs installed.
+Earlier iterations shelled out to ANTs and Freesurfer binaries
+(`antsRegistrationSyNQuick.sh`, `mri_synthstrip`, `N4BiasFieldCorrection`).
+Those aren't present on a fresh GPU image and `antsRegistrationSyNQuick.sh`
+resamples onto the template grid only as a side effect. We now call the
+`antspyx` Python API directly: same scientific operations, no external
+toolchain, and the registered output lands on the template grid so every
+subject shares one shape.
+
+`antspyx` / `antspynet` are Linux/Mac wheels (gated out on Windows in
+`pyproject.toml`), so every heavy import is **lazy** — importing this module
+stays cheap and dependency-free on Windows, and the test-suite keeps
+monkey-patching these functions with `passthrough_copy`.
 """
 
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 
 
 class CLIError(RuntimeError):
-    """Raised when an external preprocessing CLI exits non-zero."""
-
-
-def synthstrip(input_nifti: Path, output_nifti: Path, *, no_csf: bool = False) -> Path:
-    """Skull-strip with Freesurfer's SynthStrip (Hoopes et al. 2022).
-
-    Assumes `mri_synthstrip` is on PATH (Freesurfer 7.4+).
-    """
-    cmd = ["mri_synthstrip", "-i", str(input_nifti), "-o", str(output_nifti)]
-    if no_csf:
-        cmd.append("--no-csf")
-    _run(cmd)
-    return output_nifti
+    """Raised when an imaging primitive cannot produce its expected output."""
 
 
 def ants_register_to_mni(
@@ -35,57 +31,68 @@ def ants_register_to_mni(
     *,
     transform: str = "Rigid",
 ) -> Path:
-    """Affine / rigid registration to MNI152 1mm via ANTs `antsRegistrationSyNQuick.sh`."""
-    cmd = [
-        "antsRegistrationSyNQuick.sh",
-        "-d",
-        "3",
-        "-f",
-        str(template_nifti),
-        "-m",
-        str(input_nifti),
-        "-o",
-        str(output_nifti.with_suffix("")) + "_",
-        "-t",
-        transform[0].lower(),
-    ]
-    _run(cmd)
-    warped = output_nifti.with_suffix("").with_name(output_nifti.stem + "_Warped.nii.gz")
-    if not warped.exists():
-        raise CLIError(f"ANTs did not produce expected output: {warped}")
-    warped.rename(output_nifti)
+    """Register `input_nifti` to an MNI152 template via antspyx.
+
+    The moving image is warped into the fixed (template) space, so the output
+    is resampled onto the template grid — giving every subject a common shape.
+    If `template_nifti` does not exist, fall back to the MNI152 template
+    bundled with antspyx (`ants.get_ants_data('mni')`).
+    """
+    import ants
+
+    template_path = Path(template_nifti)
+    if not template_path.exists():
+        template_path = Path(ants.get_ants_data("mni"))
+
+    fixed = ants.image_read(str(template_path))
+    moving = ants.image_read(str(input_nifti))
+    reg = ants.registration(fixed=fixed, moving=moving, type_of_transform=transform)
+    warped = reg.get("warpedmovout")
+    if warped is None:
+        raise CLIError(f"antspyx registration produced no warpedmovout for {input_nifti}")
+
+    output_nifti.parent.mkdir(parents=True, exist_ok=True)
+    ants.image_write(warped, str(output_nifti))
+    return output_nifti
+
+
+def synthstrip(input_nifti: Path, output_nifti: Path, *, no_csf: bool = False) -> Path:
+    """Brain-extract `input_nifti`.
+
+    Primary path: antspynet deep brain extraction (`modality='t1'`). If
+    antspynet/TensorFlow is unavailable or fails, fall back to an antspyx
+    Otsu mask so the pipeline degrades instead of dying.
+    """
+    import ants
+
+    img = ants.image_read(str(input_nifti))
+    try:
+        from antspynet.utilities import brain_extraction
+
+        prob = brain_extraction(img, modality="t1")
+        mask = ants.threshold_image(prob, 0.5, 1.0, 1, 0)
+    except Exception:
+        mask = ants.get_mask(img)
+
+    brain = ants.mask_image(img, mask)
+    output_nifti.parent.mkdir(parents=True, exist_ok=True)
+    ants.image_write(brain, str(output_nifti))
     return output_nifti
 
 
 def n4_bias_correct(input_nifti: Path, output_nifti: Path) -> Path:
-    """N4 bias-field correction (ANTs `N4BiasFieldCorrection`)."""
-    cmd = [
-        "N4BiasFieldCorrection",
-        "-d",
-        "3",
-        "-i",
-        str(input_nifti),
-        "-o",
-        str(output_nifti),
-    ]
-    _run(cmd)
+    """N4 bias-field correction via antspyx (`ants.n4_bias_field_correction`)."""
+    import ants
+
+    img = ants.image_read(str(input_nifti))
+    corrected = ants.n4_bias_field_correction(img)
+    output_nifti.parent.mkdir(parents=True, exist_ok=True)
+    ants.image_write(corrected, str(output_nifti))
     return output_nifti
 
 
-def _run(cmd: list[str]) -> None:
-    """Execute `cmd`, raise `CLIError` on non-zero exit."""
-    try:
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise CLIError(f"Executable not found: {cmd[0]}") from exc
-    if result.returncode != 0:
-        raise CLIError(
-            f"Command failed (exit {result.returncode}): {' '.join(cmd)}\nstderr:\n{result.stderr}"
-        )
-
-
 def passthrough_copy(input_nifti: Path, output_nifti: Path, **_: object) -> Path:
-    """No-op stand-in used by tests to short-circuit external CLIs."""
+    """No-op stand-in used by tests to short-circuit the imaging primitives."""
     output_nifti.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(str(input_nifti), str(output_nifti))
     return output_nifti

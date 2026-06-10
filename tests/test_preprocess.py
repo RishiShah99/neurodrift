@@ -71,6 +71,35 @@ def test_iter_bids_finds_t1(synth_t1: Path) -> None:
     assert scan.path.name == "sub-001_ses-01_T1w.nii.gz"
 
 
+def test_iter_bids_grouped_layout(tmp_path: Path) -> None:
+    """Raw mirrors land as <cohort>/<site|dataset>/sub-XXX/[ses-YY/]anat/...
+
+    iter_bids must find scans below an extra grouping level and ignore the
+    flat `.done.*` sentinels (which end in .nii.gz but live at the root).
+    """
+    root = tmp_path / "raw" / "abide"
+    vol = nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), np.eye(4))
+
+    # site/sub/anat (no session) — ABIDE shape
+    a = root / "CMU_a" / "sub-0050642" / "anat"
+    a.mkdir(parents=True)
+    nib.save(vol, str(a / "sub-0050642_T1w.nii.gz"))
+
+    # dataset/sub/ses/anat — OpenNeuro shape
+    b = root / "ds000221" / "sub-010002" / "ses-01" / "anat"
+    b.mkdir(parents=True)
+    nib.save(vol, str(b / "sub-010002_ses-01_T2w.nii.gz"))
+
+    # flat sentinel at the root: ends in .nii.gz but must be ignored
+    (root / ".done.abide_CMU_a_sub-0050642_anat_sub-0050642_T1w.nii.gz").touch()
+
+    scans = sorted(iter_bids(root), key=lambda s: s.stem)
+    assert [(s.subject, s.session, s.modality) for s in scans] == [
+        ("sub-0050642", None, "T1w"),
+        ("sub-010002", "ses-01", "T2w"),
+    ]
+
+
 def test_pipeline_end_to_end(
     synth_t1: Path, template: Path, tmp_path: Path, stub_external_cli: None
 ) -> None:

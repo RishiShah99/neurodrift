@@ -40,24 +40,39 @@ _SUFFIX_TO_MODALITY: dict[str, Modality] = {
 def iter_bids(root: Path) -> Iterator[Scan]:
     """Yield `Scan` objects for every anat/dwi NIfTI under a BIDS-style root.
 
-    Recognized suffixes: `T1w`, `T2w`, `FLAIR`, `dwi`. Files outside `anat/`
-    or `dwi/` are skipped.
+    Depth-agnostic: finds every `anat/` or `dwi/` directory at any depth and
+    derives subject/session from the nearest `sub-*` / `ses-*` ancestor. This
+    tolerates an extra grouping level above `sub-*` — our raw mirrors land as
+    `<cohort>/<site|dataset>/sub-XXX/[ses-YY/]{anat,dwi}/*.nii.gz` — as well as
+    the canonical `sub-XXX/[ses-YY/]{anat,dwi}/...` tree. Flat sentinel files at
+    the root are skipped because their parent is not an `anat`/`dwi` directory.
+
+    Recognized suffixes: `T1w`, `T2w`, `FLAIR`, `dwi`.
     """
     root = Path(root)
-    for sub_dir in sorted(root.glob("sub-*")):
-        subject = sub_dir.name
-        session_dirs = sorted(sub_dir.glob("ses-*")) or [sub_dir]
-        for ses_dir in session_dirs:
-            session = ses_dir.name if ses_dir.name.startswith("ses-") else None
-            for kind in ("anat", "dwi"):
-                kind_dir = ses_dir / kind
-                if not kind_dir.is_dir():
+    seen: set[Path] = set()
+    for kind in ("anat", "dwi"):
+        for kind_dir in sorted(root.rglob(kind)):
+            if not kind_dir.is_dir() or kind_dir in seen:
+                continue
+            seen.add(kind_dir)
+            subject = _ancestor_token(kind_dir, "sub-")
+            if subject is None:
+                continue
+            session = _ancestor_token(kind_dir, "ses-")
+            for nii in sorted(kind_dir.glob("*.nii*")):
+                modality = _modality_from_filename(nii.name)
+                if modality is None:
                     continue
-                for nii in sorted(kind_dir.glob("*.nii*")):
-                    modality = _modality_from_filename(nii.name)
-                    if modality is None:
-                        continue
-                    yield Scan(subject=subject, session=session, modality=modality, path=nii)
+                yield Scan(subject=subject, session=session, modality=modality, path=nii)
+
+
+def _ancestor_token(path: Path, prefix: str) -> str | None:
+    """Return the nearest ancestor directory name starting with `prefix`."""
+    for parent in path.parents:
+        if parent.name.startswith(prefix):
+            return parent.name
+    return None
 
 
 def _modality_from_filename(name: str) -> Modality | None:
