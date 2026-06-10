@@ -6,6 +6,13 @@ defaults:
 seed: 1337
 output_dir: ${oc.env:NEURODRIFT_OUT,./out}/${experiment_name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
+# Stable (NOT timestamped) checkpoint dir keyed by experiment, so a spot box that
+# gets preempted and relaunched resumes itself from last.ckpt.
+ckpt_dir: ${oc.env:NEURODRIFT_OUT,./out}/${experiment_name}/ckpt
+# Resume control: "last"/"auto" resumes from ckpt_dir/last.ckpt if it exists else
+# starts fresh; null/"none" always starts fresh; or pass an explicit ckpt path.
+ckpt_path: last
+
 # Local TensorBoard logging. Set false for unit-test fast_dev_run.
 log_to_tensorboard: true
 

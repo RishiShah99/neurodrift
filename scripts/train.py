@@ -20,6 +20,24 @@ from omegaconf import DictConfig, OmegaConf
 log = logging.getLogger("neurodrift.train")
 
 
+def _resolve_resume(ckpt_path: str | None, ckpt_dir: Path) -> str | None:
+    """Map the `ckpt_path` config to an actual path for `Trainer.fit`.
+
+    "last"/"auto" -> ckpt_dir/last.ckpt if it exists, else None (fresh start, so
+    the very first launch of a spot cook just begins). null/"none"/"" -> None.
+    Anything else is treated as an explicit checkpoint path.
+    """
+    if ckpt_path is None:
+        return None
+    val = str(ckpt_path).strip().lower()
+    if val in ("", "none", "null", "fresh"):
+        return None
+    if val in ("last", "auto"):
+        last = ckpt_dir / "last.ckpt"
+        return str(last) if last.exists() else None
+    return str(ckpt_path)
+
+
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     seed_everything(cfg.seed)
@@ -27,6 +45,10 @@ def main(cfg: DictConfig) -> None:
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Stable checkpoint dir (survives relaunch); falls back to the run dir if unset.
+    ckpt_dir = Path(cfg.get("ckpt_dir") or (output_dir / "ckpt"))
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     model = instantiate(cfg.model)
     data = instantiate(cfg.data)
@@ -59,7 +81,7 @@ def main(cfg: DictConfig) -> None:
 
     callbacks: list[L.Callback] = [
         L.pytorch.callbacks.ModelCheckpoint(
-            dirpath=output_dir / "ckpt",
+            dirpath=ckpt_dir,
             monitor="val/loss",
             mode="min",
             save_top_k=3,
@@ -71,7 +93,12 @@ def main(cfg: DictConfig) -> None:
         callbacks.insert(0, L.pytorch.callbacks.LearningRateMonitor(logging_interval="step"))
 
     trainer: L.Trainer = instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
-    trainer.fit(lit, datamodule=data)
+
+    fast_dev_run = bool(cfg.trainer.get("fast_dev_run", False))
+    resume = None if fast_dev_run else _resolve_resume(cfg.get("ckpt_path"), ckpt_dir)
+    if resume:
+        log.info("resuming from checkpoint: %s", resume)
+    trainer.fit(lit, datamodule=data, ckpt_path=resume)
 
 
 if __name__ == "__main__":
