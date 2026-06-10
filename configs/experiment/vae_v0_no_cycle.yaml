@@ -1,0 +1,10 @@
+# @package _global_
+# Ablation: cross-modal cycle loss off.
+defaults:
+  - vae_v0
+  - _self_
+
+experiment_name: vae_v0_no_cycle
+
+litmodule:
+  cycle_weight: 0.0

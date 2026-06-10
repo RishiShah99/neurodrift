@@ -1,0 +1,10 @@
+# @package _global_
+# Ablation: β-KL = 1e-5 (lighter latent regularization).
+defaults:
+  - vae_v0
+  - _self_
+
+experiment_name: vae_v0_beta_low
+
+model:
+  beta_kl: 1.0e-5

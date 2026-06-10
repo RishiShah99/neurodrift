@@ -1,0 +1,10 @@
+# @package _global_
+# Ablation: latent channels = 8.
+defaults:
+  - vae_v0
+  - _self_
+
+experiment_name: vae_v0_latent8
+
+model:
+  latent_channels: 8

@@ -25,6 +25,7 @@ dependencies = [
   "scikit-learn>=1.5",
   "nibabel>=5.2",
   "zarr>=2.18,<3",
+  "gcsfs>=2024.6",
   "einops>=0.8",
   "hydra-core>=1.3",
   "omegaconf>=2.3",
@@ -38,6 +39,7 @@ dependencies = [
 # Training / GPU stack. Installed on the fleet box, not necessarily locally.
 gpu = [
   "torch>=2.6",
+  "torchvision>=0.21",
   "lightning>=2.4",
   "diffusers>=0.30",
   "transformers>=4.45",
@@ -49,6 +51,7 @@ gpu = [
 # Medical imaging tooling. antspyx wheels are unreliable on Windows; gate to Linux/Mac.
 imaging = [
   "antspyx>=0.4; platform_system != 'Windows'",
+  "antspynet>=0.2; platform_system != 'Windows'",
   "neuroharmonize>=2.1",
   "SimpleITK>=2.4",
   "pydicom>=2.4",
@@ -131,6 +134,8 @@ module = [
   "monai.*",
   "neuroharmonize.*",
   "antspyx.*",
+  "ants.*",
+  "antspynet.*",
   "gsplat.*",
   "diffusers.*",
   "zarr.*",

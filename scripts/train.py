@@ -1,8 +1,8 @@
 """Hydra-composed Lightning training entrypoint.
 
 Usage:
-    uv run python scripts/train.py experiment=vae_phase1
-    uv run python scripts/train.py experiment=vae_phase1 trainer.fast_dev_run=true
+    uv run python scripts/train.py experiment=vae_v0
+    uv run python scripts/train.py experiment=vae_v0 trainer.fast_dev_run=true
 """
 
 from __future__ import annotations
@@ -37,22 +37,14 @@ def main(cfg: DictConfig) -> None:
     def scheduler_partial(optimizer):  # type: ignore[no-untyped-def]
         return call(cfg.scheduler, optimizer=optimizer)
 
+    lit_kwargs: dict = OmegaConf.to_container(cfg.get("litmodule", {}), resolve=True) or {}
+    lit_kwargs.pop("_target_", None)
     lit = VAELitModule(
         model=model,
         optimizer_partial=optimizer_partial,
         scheduler_partial=scheduler_partial,
+        **lit_kwargs,
     )
-
-    callbacks: list[L.Callback] = [
-        L.pytorch.callbacks.LearningRateMonitor(logging_interval="step"),
-        L.pytorch.callbacks.ModelCheckpoint(
-            dirpath=output_dir / "ckpt",
-            monitor="val/loss",
-            mode="min",
-            save_top_k=3,
-            save_last=True,
-        ),
-    ]
 
     logger: L.pytorch.loggers.Logger | bool
     if cfg.log_to_tensorboard and not cfg.trainer.get("fast_dev_run", False):
@@ -64,6 +56,19 @@ def main(cfg: DictConfig) -> None:
         logger.log_hyperparams(OmegaConf.to_container(cfg, resolve=True))  # type: ignore[arg-type]
     else:
         logger = False
+
+    callbacks: list[L.Callback] = [
+        L.pytorch.callbacks.ModelCheckpoint(
+            dirpath=output_dir / "ckpt",
+            monitor="val/loss",
+            mode="min",
+            save_top_k=3,
+            save_last=True,
+        ),
+    ]
+    # LearningRateMonitor needs a logger to write to; skip it on fast_dev_run.
+    if logger is not False:
+        callbacks.insert(0, L.pytorch.callbacks.LearningRateMonitor(logging_interval="step"))
 
     trainer: L.Trainer = instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
     trainer.fit(lit, datamodule=data)

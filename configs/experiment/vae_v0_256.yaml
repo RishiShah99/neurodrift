@@ -1,0 +1,11 @@
+# @package _global_
+# Multi-res curriculum stage 3: 256³ crops.
+defaults:
+  - vae_v0
+  - _self_
+
+experiment_name: vae_v0_256
+
+data:
+  image_size: 256
+  batch_size: 1
