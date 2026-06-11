@@ -130,6 +130,9 @@ def _random_crop_or_pad(volume: np.ndarray, size: int, rng: random.Random) -> np
     return out
 
 
+_ZSCORE_CLIP = 10.0  # std devs; real brain signal sits well within ±6
+
+
 def _zscore(x: np.ndarray) -> np.ndarray:
     # Source volumes can carry NaN/inf voxels (out-of-FOV / masked regions) AND
     # finite-but-huge intensities. nan_to_num handles the former; the latter
@@ -138,6 +141,12 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     # z-scores that survive into the target and poison the shared encoder ->
     # NaN loss -> NaN gradients. Reduce in float64 and sanitize the output so
     # neither path can inject a non-finite value downstream.
+    #
+    # Sanitizing to finite is necessary but not sufficient: an extreme finite
+    # voxel z-scores to a huge finite value, which dominates the recon L1 and
+    # produces giant per-batch loss spikes (grad-clipping contains them, but the
+    # batch is wasted). Clip to ±_ZSCORE_CLIP std so pathological outlier voxels
+    # can't swamp the loss; genuine anatomy is unaffected at 10 std.
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
     nonzero = x[x > 0].astype(np.float64)
     if nonzero.size < 100:
@@ -145,6 +154,7 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     mu = nonzero.mean()
     sd = nonzero.std() + 1e-6
     out = (x.astype(np.float64) - mu) / sd
+    out = np.clip(out, -_ZSCORE_CLIP, _ZSCORE_CLIP)
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 

@@ -134,6 +134,9 @@ def test_zscore_sanitizes_overflow_and_nonfinite() -> None:
         out = _zscore(vol)
         assert np.isfinite(out).all(), "z-scored volume must be entirely finite"
         assert out.dtype == np.float32
+        # extreme finite voxels must be clipped, not just finite, so a single
+        # outlier can't dominate the recon L1 and spike the per-batch loss
+        assert np.abs(out).max() <= 10.0 + 1e-3, "z-scored output must be clipped to ±10 std"
 
 
 def test_batch_shape_and_mask(fake_zarr_root: Path) -> None:
