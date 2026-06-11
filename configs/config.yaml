@@ -16,6 +16,13 @@ ckpt_path: last
 # Local TensorBoard logging. Set false for unit-test fast_dev_run.
 log_to_tensorboard: true
 
+# Single-process eval (scripts/eval.py). Canonical v0 metrics; the live DDP
+# epoch metrics are per-rank-local and not trustworthy for the post.
+eval:
+  ckpt: null          # path to a Lightning or bare state-dict checkpoint
+  max_batches: null   # cap val batches for a quick smoke; null = full val set
+  cross_modal: true   # also compute the T1->T2-style synthesis matrix
+
 hydra:
   run:
     dir: ${output_dir}
