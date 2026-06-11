@@ -13,6 +13,8 @@ that exist for one scan, applies modality dropout, and emits:
         "modality_mask": (B, M) float tensor — 1 = fed to the encoder, 0 = dropped/missing
         "present_mask":  (B, M) float tensor — 1 = acquired for this scan (drives the
                                                recon loss), 0 = never acquired
+        "age":           (B,) float tensor — scan age from Zarr attrs, NaN if unknown
+                                             (Phase-2 conditioning hook)
         "cohort":        list[str] of length B
     }
 
@@ -22,6 +24,7 @@ stems line up with the right channel.
 
 from __future__ import annotations
 
+import math
 import random
 import re
 from collections import defaultdict
@@ -162,9 +165,9 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.groups)
 
-    def _load_volume(self, url: str) -> np.ndarray:
+    def _load_volume(self, url: str) -> tuple[np.ndarray, dict[str, Any]]:
         root = zarr.open(url, mode="r")
-        return np.asarray(root["data"], dtype=np.float32)
+        return np.asarray(root["data"], dtype=np.float32), dict(root.attrs)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         group = self.groups[idx]
@@ -179,15 +182,23 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
         # silently training the decoder to emit zeros for dropped slots.
         target = np.zeros(shape, dtype=np.float32)
         present_mask = np.zeros(m, dtype=np.float32)
+        age = float(
+            "nan"
+        )  # Phase-2 conditioning hook; read from Zarr attrs if preprocessing wrote it.
 
         for i, modality in enumerate(self.modalities):
             url = group.scans_by_modality.get(modality)
             if url is None:
                 continue
-            vol = self._load_volume(url)
+            vol, attrs = self._load_volume(url)
             vol = _random_crop_or_pad(vol, self.image_size, rng)
             target[i] = _zscore(vol)
             present_mask[i] = 1.0
+            if math.isnan(age) and attrs.get("age") not in (None, ""):
+                try:
+                    age = float(attrs["age"])
+                except (TypeError, ValueError):
+                    age = float("nan")
 
         retain_mask = present_mask.copy()
         if self.train and self.modality_dropout_p > 0:
@@ -208,6 +219,7 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
             "target": torch.from_numpy(target),
             "modality_mask": torch.from_numpy(retain_mask),
             "present_mask": torch.from_numpy(present_mask),
+            "age": torch.tensor(age, dtype=torch.float32),
             "cohort": group.cohort,
             "subject": group.subject,
             "session": group.session or "",
@@ -220,6 +232,7 @@ def _collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "target": torch.stack([s["target"] for s in samples]),
         "modality_mask": torch.stack([s["modality_mask"] for s in samples]),
         "present_mask": torch.stack([s["present_mask"] for s in samples]),
+        "age": torch.stack([s["age"] for s in samples]),
         "cohort": [s["cohort"] for s in samples],
         "subject": [s["subject"] for s in samples],
         "session": [s["session"] for s in samples],

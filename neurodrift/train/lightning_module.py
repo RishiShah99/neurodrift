@@ -224,6 +224,13 @@ class VAELitModule(L.LightningModule):
         if self.scheduler_partial is None:
             return optimizer
         scheduler = self.scheduler_partial(optimizer)
+        # The configured T_max is a guess; the true step count depends on corpus
+        # size, devices, batch size and accumulation — all of which have churned
+        # on this project. Pin the cosine half-period to the actual planned step
+        # count so the LR genuinely anneals to eta_min instead of stalling halfway.
+        total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
+        if total_steps and hasattr(scheduler, "T_max"):
+            scheduler.T_max = int(total_steps)
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
