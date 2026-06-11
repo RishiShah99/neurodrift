@@ -7,3 +7,6 @@ base_channels: 64
 channel_mults: [1, 2, 4]
 num_res_blocks: 2
 beta_kl: 1.0e-4
+# Gradient checkpointing: off by default (H100 has the memory). Set true on
+# 40 GB cards (A100-40) to fit the cycle-loss double-encode into VRAM.
+use_checkpoint: false

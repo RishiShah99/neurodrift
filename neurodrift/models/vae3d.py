@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -84,8 +85,10 @@ class _EncoderBody(nn.Module):
         channel_mults: Sequence[int],
         num_res_blocks: int,
         latent_channels: int,
+        use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         chans = [base_channels * m for m in channel_mults]
         blocks: list[nn.Module] = []
         c_in = base_channels
@@ -102,7 +105,10 @@ class _EncoderBody(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = x
         for b in self.blocks:
-            h = b(h)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                h = checkpoint(b, h, use_reentrant=False)
+            else:
+                h = b(h)
         h = self.out_conv(F.silu(self.out_norm(h)))
         mu, logvar = h.chunk(2, dim=1)
         return mu, logvar
@@ -117,8 +123,10 @@ class _DecoderBody(nn.Module):
         channel_mults: Sequence[int],
         num_res_blocks: int,
         latent_channels: int,
+        use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         chans = [base_channels * m for m in channel_mults][::-1]
         self.in_conv = _conv3(latent_channels, chans[0])
         blocks: list[nn.Module] = []
@@ -136,7 +144,10 @@ class _DecoderBody(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         h = self.in_conv(z)
         for b in self.blocks:
-            h = b(h)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                h = checkpoint(b, h, use_reentrant=False)
+            else:
+                h = b(h)
         return self.out_conv(F.silu(self.out_norm(h)))
 
 
@@ -154,6 +165,7 @@ class VAE3D(nn.Module):
         channel_mults: Sequence[int] = (1, 2, 4),
         num_res_blocks: int = 2,
         beta_kl: float = 1.0e-4,
+        use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         self.modalities = tuple(modalities)
@@ -163,14 +175,19 @@ class VAE3D(nn.Module):
         self.channel_mults = tuple(channel_mults)
         self.num_res_blocks = num_res_blocks
         self.beta_kl = beta_kl
+        self.use_checkpoint = use_checkpoint
 
         self.stems = nn.ModuleList([_conv3(1, base_channels) for _ in range(self.num_modalities)])
         self.modality_embed = nn.Parameter(torch.zeros(self.num_modalities, base_channels))
 
-        self.encoder = _EncoderBody(base_channels, channel_mults, num_res_blocks, latent_channels)
+        self.encoder = _EncoderBody(
+            base_channels, channel_mults, num_res_blocks, latent_channels, use_checkpoint
+        )
         self.decoders = nn.ModuleList(
             [
-                _DecoderBody(base_channels, channel_mults, num_res_blocks, latent_channels)
+                _DecoderBody(
+                    base_channels, channel_mults, num_res_blocks, latent_channels, use_checkpoint
+                )
                 for _ in range(self.num_modalities)
             ]
         )
