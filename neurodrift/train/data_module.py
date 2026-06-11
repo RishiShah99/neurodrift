@@ -5,9 +5,14 @@ stores by (cohort, subject, session) so a single batch sees all modalities
 that exist for one scan, applies modality dropout, and emits:
 
     {
-        "image":         (B, M, D, H, W) tensor — zero-filled for dropped slots
-        "modality_mask": (B, M) float tensor — 1 = present, 0 = dropped/missing
-        "age":           (B,)  float tensor (NaN if unknown)
+        "image":         (B, M, D, H, W) tensor — model INPUT; zero-filled for dropped slots
+        "target":        (B, M, D, H, W) tensor — clean recon TARGET; every acquired
+                                                  modality kept intact (never zeroed),
+                                                  so dropped-input slots are a real
+                                                  cross-modal synthesis objective
+        "modality_mask": (B, M) float tensor — 1 = fed to the encoder, 0 = dropped/missing
+        "present_mask":  (B, M) float tensor — 1 = acquired for this scan (drives the
+                                               recon loss), 0 = never acquired
         "cohort":        list[str] of length B
     }
 
@@ -166,7 +171,13 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
         rng = random.Random(self._seed + idx if not self.train else None)
 
         m = len(self.modalities)
-        image = np.zeros((m, self.image_size, self.image_size, self.image_size), dtype=np.float32)
+        shape = (m, self.image_size, self.image_size, self.image_size)
+        # `target` holds every acquired modality at full fidelity; `image` is the
+        # encoder input, which gets dropped slots zeroed below. Keeping them
+        # separate is what makes modality dropout a cross-modal *synthesis*
+        # objective (reconstruct the dropped modality's true volume) instead of
+        # silently training the decoder to emit zeros for dropped slots.
+        target = np.zeros(shape, dtype=np.float32)
         present_mask = np.zeros(m, dtype=np.float32)
 
         for i, modality in enumerate(self.modalities):
@@ -175,7 +186,7 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
                 continue
             vol = self._load_volume(url)
             vol = _random_crop_or_pad(vol, self.image_size, rng)
-            image[i] = _zscore(vol)
+            target[i] = _zscore(vol)
             present_mask[i] = 1.0
 
         retain_mask = present_mask.copy()
@@ -187,12 +198,14 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
                 kept = rng.choice([i for i in range(m) if present_mask[i] == 1.0])
                 retain_mask[kept] = 1.0
 
+        image = target.copy()
         for i in range(m):
             if retain_mask[i] == 0.0:
                 image[i] = 0.0
 
         return {
             "image": torch.from_numpy(image),
+            "target": torch.from_numpy(target),
             "modality_mask": torch.from_numpy(retain_mask),
             "present_mask": torch.from_numpy(present_mask),
             "cohort": group.cohort,
@@ -204,6 +217,7 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
 def _collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
     batch: dict[str, Any] = {
         "image": torch.stack([s["image"] for s in samples]),
+        "target": torch.stack([s["target"] for s in samples]),
         "modality_mask": torch.stack([s["modality_mask"] for s in samples]),
         "present_mask": torch.stack([s["present_mask"] for s in samples]),
         "cohort": [s["cohort"] for s in samples],

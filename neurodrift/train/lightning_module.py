@@ -126,7 +126,6 @@ class VAELitModule(L.LightningModule):
 
     def _cycle_loss(
         self,
-        target: torch.Tensor,
         recon: torch.Tensor,
         mu: torch.Tensor,
         present_mask: torch.Tensor,
@@ -173,25 +172,33 @@ class VAELitModule(L.LightningModule):
 
     def _step(self, batch: dict[str, Any], stage: str) -> torch.Tensor:
         x = batch["image"]
+        # `target` is the clean, never-dropped volume. Reconstructing against it
+        # (not the zero-filled input `x`) is what turns modality dropout into a
+        # cross-modal synthesis objective. Falls back to `x` for any caller that
+        # predates the target split.
+        target = batch.get("target", x)
         modality_mask = batch["modality_mask"]
         present_mask = batch["present_mask"]
         cohorts = batch["cohort"]
 
         out = self.model(x, modality_mask)
 
-        recon_loss = _masked_l1(out.recon, x, present_mask)
+        recon_loss = _masked_l1(out.recon, target, present_mask)
         kl = _kl_divergence(out.mu, out.logvar)
         beta = self._kl_beta()
         loss = recon_loss + beta * self.model.beta_kl * kl
 
         perc_loss = x.new_zeros(())
         if self.perceptual is not None and stage == "train":
-            perc_loss = self.perceptual(out.recon, x)
+            # Zero recon's never-acquired slots so they match `target` (also zero
+            # there) and contribute no spurious perceptual gradient.
+            recon_perc = out.recon * present_mask.view(*present_mask.shape, 1, 1, 1)
+            perc_loss = self.perceptual(recon_perc, target)
             loss = loss + self.perceptual_weight * perc_loss
 
         cycle = x.new_zeros(())
         if self.cycle_weight > 0 and stage == "train":
-            cycle = self._cycle_loss(x, out.recon, out.mu, present_mask)
+            cycle = self._cycle_loss(out.recon, out.mu, present_mask)
             loss = loss + self.cycle_weight * cycle
 
         bs = x.shape[0]
@@ -203,7 +210,7 @@ class VAELitModule(L.LightningModule):
         self.log(f"{stage}/cycle", cycle, on_epoch=True, batch_size=bs)
 
         if not math.isnan(loss.item()):
-            self._log_per_cohort_psnr(out.recon, x, present_mask, cohorts, stage)
+            self._log_per_cohort_psnr(out.recon, target, present_mask, cohorts, stage)
         return loss
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:

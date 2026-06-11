@@ -57,6 +57,61 @@ def test_discover_groups_modalities_by_subject(fake_zarr_root: Path) -> None:
     assert len(dm.train_ds) + len(dm.val_ds) == 2
 
 
+def test_dropout_preserves_clean_target(fake_zarr_root: Path) -> None:
+    """Modality dropout must zero the INPUT slot but keep the TARGET intact.
+
+    Regression for the reconstruct-against-zero bug: if a dropped-but-acquired
+    modality had its target zeroed, the masked-L1 (driven by present_mask) would
+    train the decoder to emit zeros for dropped modalities, destroying cross-modal
+    synthesis — and invisibly, since validation runs with dropout_p=0.
+    """
+    from neurodrift.train.data_module import ZarrMultimodalDataModule
+
+    dm = ZarrMultimodalDataModule(
+        zarr_root=str(fake_zarr_root),
+        cohorts=["ixi"],
+        modalities=["T1w", "T2w", "PDw", "dwi"],
+        image_size=32,
+        batch_size=2,
+        num_workers=0,
+        val_fraction=0.5,
+        modality_dropout_p=1.0,  # drop as aggressively as the keep-one guard allows
+    )
+    dm.setup()
+    ds = dm.train_ds
+    assert ds is not None
+    saw_dropped_but_present = False
+    for idx in range(len(ds)):
+        s = ds[idx]
+        image, target = s["image"], s["target"]
+        present, retain = s["present_mask"], s["modality_mask"]
+        for j in range(present.shape[0]):
+            if present[j] == 1.0 and retain[j] == 0.0:
+                saw_dropped_but_present = True
+                assert image[j].abs().sum() == 0.0, "dropped modality must be zeroed in the INPUT"
+                assert target[j].abs().sum() > 0.0, "acquired modality must stay intact in TARGET"
+            if retain[j] == 1.0:
+                assert torch.equal(image[j], target[j]), "kept slot: input must equal target"
+    assert saw_dropped_but_present, "test setup never produced a dropped-but-acquired modality"
+
+
+def test_target_drives_masked_l1_for_dropped_modality() -> None:
+    """A dropped-but-acquired modality must yield a real (nonzero-target) recon loss.
+
+    With the old behaviour the target slot was zero, so a decoder that emitted
+    zeros would score a perfect loss on dropped modalities. Here the masked-L1 is
+    computed against the clean target, so emitting zeros is penalised.
+    """
+    from neurodrift.train.lightning_module import _masked_l1
+
+    b, m, d = 1, 2, 8
+    recon = torch.zeros(b, m, d, d, d)  # decoder that emits zeros everywhere
+    target = torch.ones(b, m, d, d, d)  # both modalities acquired, nonzero truth
+    present = torch.ones(b, m)
+    loss = _masked_l1(recon, target, present)
+    assert loss.item() == pytest.approx(1.0), "zeros-vs-clean-target must incur real L1"
+
+
 def test_batch_shape_and_mask(fake_zarr_root: Path) -> None:
     dm = ZarrMultimodalDataModule(
         zarr_root=str(fake_zarr_root),
