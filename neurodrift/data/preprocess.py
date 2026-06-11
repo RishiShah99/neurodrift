@@ -74,7 +74,9 @@ class SkullStripStep(Step):
         fn = self.cli_fn or cli.synthstrip
         prev = work_dir / RegisterStep.name / f"{scan.stem}.nii.gz"
         src = prev if prev.exists() else scan.path
-        return fn(src, out)
+        # Pass the scan modality so brain extraction uses the contrast-matched
+        # model (t1/t2/flair) instead of always assuming T1.
+        return fn(src, out, modality=scan.modality)
 
 
 @dataclass

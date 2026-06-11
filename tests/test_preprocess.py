@@ -140,5 +140,32 @@ def test_pipeline_idempotent(
     assert first_mtimes == second_mtimes, "intermediate files were rewritten on second run"
 
 
+def test_skullstrip_uses_scan_modality(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The skull-strip step must pass the scan's modality to brain extraction.
+
+    Regression for a silent quality bug: brain_extraction was hardcoded to the
+    T1 model, so T2w/FLAIR volumes were masked with the wrong contrast model.
+    """
+    from neurodrift.data.bids import Scan
+    from neurodrift.data.preprocess import SkullStripStep
+
+    seen: set[str] = set()
+
+    def capture(input_nifti: Path, output_nifti: Path, **kw: Any) -> Path:
+        seen.add(kw.get("modality", "MISSING"))
+        return ext_cli.passthrough_copy(input_nifti, output_nifti)
+
+    monkeypatch.setattr(ext_cli, "synthstrip", capture)
+
+    work = tmp_path / "work"
+    for mod in ("T1w", "T2w", "FLAIR"):
+        src = tmp_path / f"sub-001_{mod}.nii.gz"
+        nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), np.eye(4)), str(src))
+        scan = Scan(subject="sub-001", session=None, modality=mod, path=src)  # type: ignore[arg-type]
+        SkullStripStep().run(scan, work)
+
+    assert seen == {"T1w", "T2w", "FLAIR"}, "skull-strip must receive each scan's modality"
+
+
 def _all_intermediates(work_dir: Path) -> list[Path]:
     return sorted(p for p in work_dir.rglob("*") if p.is_file())

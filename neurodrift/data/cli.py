@@ -56,12 +56,22 @@ def ants_register_to_mni(
     return output_nifti
 
 
-def synthstrip(input_nifti: Path, output_nifti: Path, *, no_csf: bool = False) -> Path:
-    """Brain-extract `input_nifti`.
+# Map our BIDS modality labels to antspynet brain-extraction model names.
+# Using the T1 model on a T2/FLAIR volume yields a wrong brain mask (the
+# contrast it was trained on is inverted), which silently degrades exactly the
+# non-T1 modalities. antspynet ships dedicated "t2"/"flair" models — use them.
+_BRAIN_EXTRACT_MODALITY: dict[str, str] = {"T1w": "t1", "T2w": "t2", "FLAIR": "flair"}
 
-    Primary path: antspynet deep brain extraction (`modality='t1'`). If
-    antspynet/TensorFlow is unavailable or fails, fall back to an antspyx
-    Otsu mask so the pipeline degrades instead of dying.
+
+def synthstrip(
+    input_nifti: Path, output_nifti: Path, *, modality: str = "T1w", no_csf: bool = False
+) -> Path:
+    """Brain-extract `input_nifti` with a contrast-matched model.
+
+    Primary path: antspynet deep brain extraction, selecting the model for the
+    scan's `modality` (t1/t2/flair). If antspynet/TensorFlow is unavailable or
+    fails, fall back to an antspyx Otsu mask so the pipeline degrades instead of
+    dying.
     """
     import ants
 
@@ -69,7 +79,8 @@ def synthstrip(input_nifti: Path, output_nifti: Path, *, no_csf: bool = False) -
     try:
         from antspynet.utilities import brain_extraction
 
-        prob = brain_extraction(img, modality="t1")
+        be_modality = _BRAIN_EXTRACT_MODALITY.get(modality, "t1")
+        prob = brain_extraction(img, modality=be_modality)
         mask = ants.threshold_image(prob, 0.5, 1.0, 1, 0)
     except Exception:
         mask = ants.get_mask(img)
