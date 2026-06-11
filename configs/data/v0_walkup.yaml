@@ -13,4 +13,10 @@ batch_size: 2
 num_workers: 4
 val_fraction: 0.05
 modality_dropout_p: 0.3
+# Cross-modal synthesis training: with this prob a multimodal subject keeps a
+# single input modality and supervises the rest (matches the 1->N eval). And
+# multimodal subjects (the only source of cross-modal signal) are oversampled
+# so the T1-only majority doesn't drown them out.
+synth_dropout_p: 0.5
+multimodal_oversample: 8.0
 seed: 1337

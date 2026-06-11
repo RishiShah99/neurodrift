@@ -95,6 +95,39 @@ def test_dropout_preserves_clean_target(fake_zarr_root: Path) -> None:
     assert saw_dropped_but_present, "test setup never produced a dropped-but-acquired modality"
 
 
+def test_synth_dropout_keeps_single_input_modality(fake_zarr_root: Path) -> None:
+    """synth_dropout_p=1.0 must leave exactly one input modality for multimodal subjects.
+
+    This is what trains the 1->N cross-modal case the eval scores; without it the
+    model only ever sees >=2 inputs and never learns single-modality synthesis.
+    """
+    from neurodrift.train.data_module import ZarrMultimodalDataModule
+
+    dm = ZarrMultimodalDataModule(
+        zarr_root=str(fake_zarr_root),
+        cohorts=["ixi"],
+        modalities=["T1w", "T2w", "PDw", "dwi"],
+        image_size=32,
+        batch_size=2,
+        num_workers=0,
+        val_fraction=0.5,
+        modality_dropout_p=0.3,
+        synth_dropout_p=1.0,  # always enter synthesis regime
+    )
+    dm.setup()
+    ds = dm.train_ds
+    assert ds is not None
+    for idx in range(len(ds)):
+        s = ds[idx]
+        present, retain = s["present_mask"], s["modality_mask"]
+        if present.sum() >= 2:  # both T1w + T2w acquired in the fixture
+            assert retain.sum().item() == 1.0, "synthesis regime must keep exactly one input"
+            # the kept modality must be one that was actually acquired
+            kept = int(retain.argmax())
+            assert present[kept] == 1.0
+            assert s["target"][kept].abs().sum() > 0.0, "held-out modalities stay in target"
+
+
 def test_target_drives_masked_l1_for_dropped_modality() -> None:
     """A dropped-but-acquired modality must yield a real (nonzero-target) recon loss.
 

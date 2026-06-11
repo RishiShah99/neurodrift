@@ -167,6 +167,7 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
         modalities: Sequence[str],
         image_size: int,
         modality_dropout_p: float = 0.3,
+        synth_dropout_p: float = 0.0,
         train: bool = True,
         seed: int = 1337,
     ) -> None:
@@ -174,6 +175,12 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
         self.modalities = list(modalities)
         self.image_size = image_size
         self.modality_dropout_p = modality_dropout_p
+        # Probability that a multimodal subject is put in the "synthesis regime":
+        # keep exactly ONE input modality and supervise the rest. This trains the
+        # 1->N case the cross-modal eval actually scores (feed T1 only, predict
+        # T2/FLAIR); plain per-modality dropout at p=0.3 almost always leaves >=2
+        # inputs, so the model never practises single-modality synthesis.
+        self.synth_dropout_p = synth_dropout_p
         self.train = train
         self._seed = seed
 
@@ -216,13 +223,18 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
                     age = float("nan")
 
         retain_mask = present_mask.copy()
-        if self.train and self.modality_dropout_p > 0:
+        present_idx = [i for i in range(m) if present_mask[i] == 1.0]
+        if self.train and len(present_idx) >= 2 and rng.random() < self.synth_dropout_p:
+            # Synthesis regime: keep exactly one modality, supervise the rest.
+            keep = rng.choice(present_idx)
+            retain_mask[:] = 0.0
+            retain_mask[keep] = 1.0
+        elif self.train and self.modality_dropout_p > 0:
             for i in range(m):
                 if retain_mask[i] == 1.0 and rng.random() < self.modality_dropout_p:
                     retain_mask[i] = 0.0
-            if retain_mask.sum() == 0 and present_mask.sum() > 0:
-                kept = rng.choice([i for i in range(m) if present_mask[i] == 1.0])
-                retain_mask[kept] = 1.0
+            if retain_mask.sum() == 0 and present_idx:
+                retain_mask[rng.choice(present_idx)] = 1.0
 
         image = target.copy()
         for i in range(m):
@@ -268,6 +280,8 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         num_workers: int = 4,
         val_fraction: float = 0.05,
         modality_dropout_p: float = 0.3,
+        synth_dropout_p: float = 0.0,
+        multimodal_oversample: float = 1.0,
         seed: int = 1337,
         **_: Any,
     ) -> None:
@@ -280,6 +294,12 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.val_fraction = val_fraction
         self.modality_dropout_p = modality_dropout_p
+        self.synth_dropout_p = synth_dropout_p
+        # Sampling weight for subjects with >=2 acquired modalities. Cross-modal
+        # synthesis can only be learned from multimodal subjects, which are a
+        # minority of the corpus (most are T1-only); oversampling them keeps the
+        # cross-modal gradient from being drowned out. 1.0 = no oversampling.
+        self.multimodal_oversample = multimodal_oversample
         self.seed = seed
         self.train_ds: ZarrMultimodalDataset | None = None
         self.val_ds: ZarrMultimodalDataset | None = None
@@ -307,6 +327,7 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
             self.modalities,
             self.image_size,
             self.modality_dropout_p,
+            synth_dropout_p=self.synth_dropout_p,
             train=True,
             seed=self.seed,
         )
@@ -315,9 +336,25 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
             self.modalities,
             self.image_size,
             modality_dropout_p=0.0,
+            synth_dropout_p=0.0,
             train=False,
             seed=self.seed,
         )
+
+    def _multimodal_count(self, group: SubjectGroup) -> int:
+        return sum(1 for mod in self.modalities if mod in group.scans_by_modality)
+
+    def _train_sampler(self) -> "torch.utils.data.Sampler[int] | None":
+        """WeightedRandomSampler oversampling multimodal subjects, or None."""
+        if self.multimodal_oversample == 1.0 or self.train_ds is None:
+            return None
+        from torch.utils.data import WeightedRandomSampler
+
+        weights = [
+            self.multimodal_oversample if self._multimodal_count(g) >= 2 else 1.0
+            for g in self.train_ds.groups
+        ]
+        return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
 
     def _loader_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -336,7 +373,11 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader[dict[str, Any]]:
         assert self.train_ds is not None
-        return DataLoader(self.train_ds, shuffle=True, **self._loader_kwargs())
+        sampler = self._train_sampler()
+        # A sampler and shuffle are mutually exclusive; the weighted sampler
+        # already randomizes order.
+        shuffle = sampler is None
+        return DataLoader(self.train_ds, shuffle=shuffle, sampler=sampler, **self._loader_kwargs())
 
     def val_dataloader(self) -> DataLoader[dict[str, Any]]:
         assert self.val_ds is not None
