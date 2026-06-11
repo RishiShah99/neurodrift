@@ -131,16 +131,21 @@ def _random_crop_or_pad(volume: np.ndarray, size: int, rng: random.Random) -> np
 
 
 def _zscore(x: np.ndarray) -> np.ndarray:
-    # Source volumes can carry NaN/inf voxels (out-of-FOV / masked regions in the
-    # preprocessed MRI). Left unsanitized they survive normalization and poison the
-    # shared encoder -> NaN loss -> NaN gradients. NaN->0 maps them to background.
-    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-    nonzero = x[x > 0]
+    # Source volumes can carry NaN/inf voxels (out-of-FOV / masked regions) AND
+    # finite-but-huge intensities. nan_to_num handles the former; the latter
+    # overflow a float32 mean/variance reduction (a single voxel above ~1.8e19
+    # squares past the float32 max), producing an inf/NaN sd and hence NaN
+    # z-scores that survive into the target and poison the shared encoder ->
+    # NaN loss -> NaN gradients. Reduce in float64 and sanitize the output so
+    # neither path can inject a non-finite value downstream.
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    nonzero = x[x > 0].astype(np.float64)
     if nonzero.size < 100:
         return x
-    mu = float(nonzero.mean())
-    sd = float(nonzero.std() + 1e-6)
-    return (x - mu) / sd
+    mu = nonzero.mean()
+    sd = nonzero.std() + 1e-6
+    out = (x.astype(np.float64) - mu) / sd
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
 class ZarrMultimodalDataset(Dataset[dict[str, Any]]):

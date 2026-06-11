@@ -112,6 +112,30 @@ def test_target_drives_masked_l1_for_dropped_modality() -> None:
     assert loss.item() == pytest.approx(1.0), "zeros-vs-clean-target must incur real L1"
 
 
+def test_zscore_sanitizes_overflow_and_nonfinite() -> None:
+    """_zscore must never emit a non-finite value, even for pathological volumes.
+
+    Regression for a silent NaN-injection path: nan_to_num removed inf/NaN voxels
+    but the float32 mean/variance reduction still overflowed on finite-but-huge
+    intensities (a single voxel > ~1.8e19 squares past the float32 max -> inf/NaN
+    sd -> NaN z-scores), which then flowed into the loss and killed the encoder.
+    """
+    from neurodrift.train.data_module import _zscore
+
+    base = np.abs(np.random.RandomState(0).randn(40, 40, 40)).astype(np.float32) + 1.0
+    # one finite voxel large enough to overflow a float32 sum-of-squares
+    spike = base.copy()
+    spike[0, 0, 0] = 1e25
+    # and a volume carrying inf/NaN voxels
+    dirty = base.copy()
+    dirty[1, 1, 1] = np.inf
+    dirty[2, 2, 2] = np.nan
+    for vol in (spike, dirty):
+        out = _zscore(vol)
+        assert np.isfinite(out).all(), "z-scored volume must be entirely finite"
+        assert out.dtype == np.float32
+
+
 def test_batch_shape_and_mask(fake_zarr_root: Path) -> None:
     dm = ZarrMultimodalDataModule(
         zarr_root=str(fake_zarr_root),
