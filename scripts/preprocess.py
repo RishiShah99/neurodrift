@@ -27,6 +27,9 @@ from neurodrift.data.preprocess import PreprocessPipeline
 
 log = logging.getLogger("preprocess")
 
+# Structural modalities the VAE trains on; dwi and other anat variants are skipped.
+_COOK_MODALITIES = frozenset({"T1w", "T2w", "FLAIR"})
+
 
 def _run(cmd: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=True, capture_output=capture, text=True)
@@ -96,8 +99,11 @@ def _process_cohort(
     work_dir = scratch / "work" / cohort
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    scans = list(iter_bids(raw_root))
-    log.info("%s: found %d scans in BIDS layout", cohort, len(scans))
+    # Only preprocess the structural modalities the VAE consumes. The fetcher
+    # also pulls dwi/ (large 4D DTI volumes) which the model never reads;
+    # processing them would burn CPU/disk on intermediates the cook ignores.
+    scans = [s for s in iter_bids(raw_root) if s.modality in _COOK_MODALITIES]
+    log.info("%s: found %d structural scans (T1w/T2w/FLAIR) in BIDS layout", cohort, len(scans))
 
     cached = set() if force else _existing_zarr_stems(bucket, cohort)
     todo: list[Scan] = [scan for scan in scans if scan.stem not in cached]
