@@ -18,3 +18,21 @@ ds003097         # lifespan T1
 ds004215         # ?
 ds002790         # AOMIC ID1000
 ds001226         # candidate
+
+# === Trimodal T1w+T2w+FLAIR (S3-verified, added for cross-modal synthesis) ===
+# The fetcher keeps anat/* and skips datasets/files that don't exist, so
+# unrecognized suffixes (MP2RAGE, T1ce) are simply ignored at preprocess.
+ds005752         # NIMH Healthy Research Volunteers — ~1001 trimodal lifespan (best)
+ds007045         # Multi-institutional glioblastoma — ~384 trimodal (T1+T2+FLAIR+T1ce)
+ds007831         # GRAND — 120 older adults, T1+T2(coplanar)+FLAIR
+ds004717         # Diffuse glioma APT — 42 trimodal
+ds004712         # ON-Harmony — 20 multi-site travelling-heads trimodal
+ds007135         # Chronic low back pain PET/MR — 15 trimodal
+
+# === T2w+FLAIR (T1 is MP2RAGE, not ingested) — adds T2<->FLAIR pairs ===
+ds004146         # QTAB — 421 adolescent twins, T2w+FLAIR(+MP2RAGE)
+
+# === T1w+FLAIR (no T2w) — boosts FLAIR recon + T1<->FLAIR synthesis ===
+ds005602         # IDEAS epilepsy surgical — 442 T1+FLAIR
+ds003592         # Aging functional architecture — 246 T1+FLAIR subset
+ds004199         # Pediatric FCD epilepsy — 170 T1+FLAIR
