@@ -123,6 +123,10 @@ def _random_crop_or_pad(volume: np.ndarray, size: int, rng: random.Random) -> np
 
 
 def _zscore(x: np.ndarray) -> np.ndarray:
+    # Source volumes can carry NaN/inf voxels (out-of-FOV / masked regions in the
+    # preprocessed MRI). Left unsanitized they survive normalization and poison the
+    # shared encoder -> NaN loss -> NaN gradients. NaN->0 maps them to background.
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     nonzero = x[x > 0]
     if nonzero.size < 100:
         return x
