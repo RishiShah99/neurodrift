@@ -49,6 +49,7 @@ def evaluate(
     recon_psnr: dict[tuple[str, str], list[float]] = defaultdict(list)
     recon_ssim: dict[tuple[str, str], list[float]] = defaultdict(list)
     xmodal_psnr: dict[tuple[str, str], list[float]] = defaultdict(list)
+    xmodal_ssim: dict[tuple[str, str], list[float]] = defaultdict(list)
     n_subjects = 0
 
     for batch in batches:
@@ -87,6 +88,9 @@ def evaluate(
                     xmodal_psnr[(mods[src], mods[dst])].append(
                         psnr(out_x.recon[i, dst], target[i, dst])
                     )
+                    xmodal_ssim[(mods[src], mods[dst])].append(
+                        ssim3d(out_x.recon[i, dst], target[i, dst])
+                    )
 
     def _summarise(d: dict[tuple[str, str], list[float]]) -> dict[str, float]:
         return {f"{a}/{b}": _mean(v) for (a, b), v in sorted(d.items())}
@@ -97,6 +101,8 @@ def evaluate(
         "recon_psnr": recon_summary,
         "recon_ssim": _summarise(recon_ssim),
         "xmodal_psnr": _summarise(xmodal_psnr),
+        "xmodal_ssim": _summarise(xmodal_ssim),
         "recon_psnr_pooled": _mean([v for vs in recon_psnr.values() for v in vs]),
         "xmodal_psnr_pooled": _mean([v for vs in xmodal_psnr.values() for v in vs]),
+        "xmodal_ssim_pooled": _mean([v for vs in xmodal_ssim.values() for v in vs]),
     }

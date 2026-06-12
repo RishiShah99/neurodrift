@@ -90,10 +90,13 @@ def main(cfg: DictConfig) -> None:
     log.info("wrote %s", out_path)
     log.info("recon PSNR (pooled): %.2f dB", metrics["recon_psnr_pooled"])
     log.info("cross-modal PSNR (pooled): %.2f dB", metrics["xmodal_psnr_pooled"])
+    log.info("cross-modal SSIM (pooled): %.4f", metrics["xmodal_ssim_pooled"])
     for k, v in metrics["recon_psnr"].items():
         log.info("  recon  %-24s %.2f dB", k, v)
     for k, v in metrics["xmodal_psnr"].items():
-        log.info("  xmodal %-24s %.2f dB", k, v)
+        log.info(
+            "  xmodal %-24s %.2f dB  (SSIM %.3f)", k, v, metrics["xmodal_ssim"].get(k, float("nan"))
+        )
 
 
 if __name__ == "__main__":
