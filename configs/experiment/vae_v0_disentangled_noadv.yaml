@@ -1,0 +1,14 @@
+# @package _global_
+# Diagnostic ablation: disentangled VAE with the adversarial term OFF.
+# Prior art says a no-GAN disentangled VAE on well-registered pairs should already
+# reach ~24-26 dB cross-modal. If this stalls near 19 dB, the bottleneck is residual
+# intra-subject registration misalignment (HANDOFF E7), not the objective — fix that
+# before blaming the GAN. Single optimizer, automatic-clip-equivalent manual clip.
+defaults:
+  - vae_v0_disentangled
+  - _self_
+
+experiment_name: vae_v0_disentangled_noadv
+
+litmodule:
+  use_adversarial: false

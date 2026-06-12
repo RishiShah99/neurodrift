@@ -1,0 +1,19 @@
+# Content/style disentangled multimodal 3D VAE — v0 improvement E1.
+# Spatial content latent (modality-invariant anatomy) + global per-modality style
+# (contrast), shared style-conditioned decoder. Cross-modal T1->T2 = content(T1) +
+# prototype-style(T2). Same external contract as VAE3D so scripts/eval.py is unchanged.
+_target_: neurodrift.models.vae3d.DisentangledVAE3D
+
+modalities: [T1w, T2w, FLAIR]
+latent_channels: 16
+style_dim: 16
+base_channels: 64
+channel_mults: [1, 2, 4]
+num_res_blocks: 2
+# Content-KL coefficient. Deliberately SMALL: prior art is explicit that a high
+# content KL compresses anatomy into the Gaussian and drops reconstruction PSNR
+# 2-4 dB. Disentanglement is held by the content-invariance loss, not by KL.
+beta_kl: 5.0e-3
+# The training step runs many decodes per batch (M self-recon + M*(M-1) translation
+# + style-cycle re-encode + discriminator). Checkpoint to fit all those graphs.
+use_checkpoint: true

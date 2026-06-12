@@ -1,0 +1,48 @@
+# @package _global_
+# v0 flagship — content/style disentangled VAE + SN-PatchGAN for cross-modal synthesis.
+# Attacks both causes of the ~19 dB cross-modal ceiling: the single-shared-latent
+# fusion bottleneck (content/style split) and the L1 blur ceiling (adversarial term).
+# Defaults to all 8 B200s so the canonical launch IS the 8-GPU launch.
+defaults:
+  - /data: v0_walkup
+  - /model: vae3d_disentangled
+  - /trainer: eight_b200
+  - _self_
+
+experiment_name: vae_v0_disentangled
+
+data:
+  # Local zarr cache makes the B200s compute-bound; 24 workers feeds 8 GPUs.
+  num_workers: 24
+
+litmodule:
+  _target_: neurodrift.train.lightning_module.DisentangledVAELitModule
+  kl_warmup_steps: 5000
+  # Loss weights from the cross-modal-MRI prior-art consensus (MUNIT/ResViT lineage).
+  recon_weight: 10.0
+  cross_weight: 10.0
+  content_invariance_weight: 2.0
+  style_cycle_weight: 1.0
+  kl_style_weight: 0.01
+  perceptual_weight: 1.0
+  # Adversarial is zero for adv_start_step, then ramps over adv_warmup_steps — the
+  # generator needs a head start or the 3D discriminator wins early and G's gradient
+  # vanishes. SN on the critic keeps it from overpowering G.
+  adversarial_weight: 0.5
+  adv_start_step: 8000
+  adv_warmup_steps: 8000
+  disc_lr: 2.0e-4
+  disc_base_channels: 32
+  use_perceptual: true
+  use_adversarial: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-4
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  T_max: 100000
+  eta_min: 1.0e-6
