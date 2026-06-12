@@ -12,7 +12,7 @@ from pathlib import Path
 
 import hydra
 import lightning as L
-from hydra.utils import call, instantiate
+from hydra.utils import call, get_class, instantiate
 from neurodrift.train.lightning_module import VAELitModule
 from neurodrift.utils.seed import seed_everything
 from omegaconf import DictConfig, OmegaConf
@@ -60,8 +60,12 @@ def main(cfg: DictConfig) -> None:
         return call(cfg.scheduler, optimizer=optimizer)
 
     lit_kwargs: dict = OmegaConf.to_container(cfg.get("litmodule", {}), resolve=True) or {}
-    lit_kwargs.pop("_target_", None)
-    lit = VAELitModule(
+    # Pick the LightningModule class from litmodule._target_ so experiments can swap
+    # in DisentangledVAELitModule (content/style + GAN) without editing this script.
+    # Falls back to the v0 VAELitModule for configs that predate _target_.
+    lit_target = lit_kwargs.pop("_target_", None)
+    lit_cls = get_class(lit_target) if lit_target else VAELitModule
+    lit = lit_cls(
         model=model,
         optimizer_partial=optimizer_partial,
         scheduler_partial=scheduler_partial,

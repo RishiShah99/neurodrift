@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from neurodrift.models.vae3d import VAE3D
+from neurodrift.models.vae3d import VAE3D, DisentangledVAE3D, PatchDiscriminator3D
 
 
 def _masked_l1(recon: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -245,3 +245,334 @@ class VAELitModule(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
         }
+
+
+# ---------------------------------------------------------------------------
+# Content/style disentangled VAE + adversarial training (v0 improvement E1+E2)
+# ---------------------------------------------------------------------------
+
+
+def _set_requires_grad(module: nn.Module, flag: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad = flag
+
+
+def _masked_mean(per_sample: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Average a per-sample (B,) loss over the samples where mask==1 (no host sync)."""
+    return (per_sample * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+class DisentangledVAELitModule(L.LightningModule):
+    """Cross-modal synthesis VAE with a content/style split + SN-PatchGAN.
+
+    Trained from the CLEAN `target` (every acquired modality at full fidelity), so
+    the cross-modal objective is explicit and dropout-independent: for each present
+    source modality `j` we (a) self-reconstruct it from its own content+style and
+    (b) translate it into every other present modality `k` using `j`'s content and
+    `k`'s learned prototype style — which is exactly the inference path the eval
+    scores. Disentanglement is held together by a content-invariance term (the
+    per-modality content codes of one subject must agree) and a style-cycle term
+    (the decoder must actually consume the style it was handed).
+
+    Uses MANUAL optimization (two optimizers: generator = VAE, discriminator). The
+    adversarial weight is zero for `adv_start_step` then linearly ramps over
+    `adv_warmup_steps` — the generator needs a head start or the 3D discriminator
+    wins early and the generator's gradient vanishes.
+    """
+
+    def __init__(
+        self,
+        model: DisentangledVAE3D,
+        optimizer_partial: Any,
+        scheduler_partial: Any | None = None,
+        kl_warmup_steps: int = 5000,
+        recon_weight: float = 10.0,
+        cross_weight: float = 10.0,
+        content_invariance_weight: float = 2.0,
+        style_cycle_weight: float = 1.0,
+        kl_style_weight: float = 0.01,
+        perceptual_weight: float = 1.0,
+        adversarial_weight: float = 0.5,
+        adv_start_step: int = 8000,
+        adv_warmup_steps: int = 8000,
+        disc_lr: float = 2.0e-4,
+        disc_base_channels: int = 32,
+        use_perceptual: bool = True,
+        use_adversarial: bool = True,
+    ) -> None:
+        super().__init__()
+        self.automatic_optimization = False
+        self.model = model
+        self.optimizer_partial = optimizer_partial
+        self.scheduler_partial = scheduler_partial
+        self.kl_warmup_steps = kl_warmup_steps
+        self.recon_weight = recon_weight
+        self.cross_weight = cross_weight
+        self.content_invariance_weight = content_invariance_weight
+        self.style_cycle_weight = style_cycle_weight
+        self.kl_style_weight = kl_style_weight
+        self.perceptual_weight = perceptual_weight
+        self.adversarial_weight = adversarial_weight
+        self.adv_start_step = adv_start_step
+        self.adv_warmup_steps = adv_warmup_steps
+        self.disc_lr = disc_lr
+        self.use_perceptual = use_perceptual
+        self.use_adversarial = use_adversarial
+        self.perceptual: nn.Module | None = _TriOrthoVGGPerceptual() if use_perceptual else None
+        self.discriminator: PatchDiscriminator3D | None = (
+            PatchDiscriminator3D(model.num_modalities, base_channels=disc_base_channels)
+            if use_adversarial
+            else None
+        )
+        # Own step counter (manual opt steps two optimizers, so global_step is an
+        # unreliable clock for the ramps). Buffered so it survives spot-resume.
+        self.register_buffer("_step_count", torch.zeros((), dtype=torch.long), persistent=True)
+
+    def forward(self, x: torch.Tensor, modality_mask: torch.Tensor | None = None) -> torch.Tensor:
+        return self.model(x, modality_mask).recon
+
+    # -- schedule helpers ---------------------------------------------------
+    def _kl_beta(self) -> float:
+        if self.kl_warmup_steps <= 0:
+            return 1.0
+        return min(1.0, float(self._step_count.item()) / float(self.kl_warmup_steps))
+
+    def _adv_weight(self) -> float:
+        if not self.use_adversarial:
+            return 0.0
+        step = float(self._step_count.item())
+        if step < self.adv_start_step:
+            return 0.0
+        if self.adv_warmup_steps <= 0:
+            return self.adversarial_weight
+        frac = (step - self.adv_start_step) / float(self.adv_warmup_steps)
+        return self.adversarial_weight * min(1.0, max(0.0, frac))
+
+    # -- masked term helpers ------------------------------------------------
+    def _vol_l1(self, rec: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        err = (rec - tgt).abs().flatten(1).mean(dim=1)  # (B,)
+        return _masked_mean(err, mask)
+
+    def _kl_content(
+        self, mu: torch.Tensor, logvar: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).flatten(1).mean(dim=1)  # (B,)
+        return _masked_mean(kl, mask)
+
+    def _perc(self, rec: torch.Tensor, tgt: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        if self.perceptual is None:
+            return rec.new_zeros(())
+        m = mask.view(-1, 1, 1, 1, 1)
+        # Zeroing absent samples makes their (normalized) slices identical -> ~0
+        # perceptual contribution, so we avoid a per-sample host sync to skip them.
+        return self.perceptual(rec * m, tgt * m)
+
+    def _hinge_g(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        per = -logits.flatten(1).mean(dim=1)  # G wants D(fake) high
+        return _masked_mean(per, mask)
+
+    def _hinge_d(
+        self, real_logits: torch.Tensor, fake_logits: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        rl = F.relu(1.0 - real_logits).flatten(1).mean(dim=1)
+        fl = F.relu(1.0 + fake_logits).flatten(1).mean(dim=1)
+        return _masked_mean(rl + fl, mask)
+
+    # -- generator forward: all disentanglement losses + cached fakes -------
+    def _generator_losses(
+        self, target: torch.Tensor, present: torch.Tensor
+    ) -> tuple[
+        torch.Tensor,
+        dict[str, torch.Tensor],
+        list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]],
+    ]:
+        b, m = present.shape
+        enc = self.model.encode_all(target, present)
+        zs = [
+            self.model.reparameterize(enc.content_mu[:, j], enc.content_logvar[:, j])
+            for j in range(m)
+        ]
+        beta = self._kl_beta()
+        adv_w = self._adv_weight()
+
+        recon_l = target.new_zeros(())
+        cross_l = target.new_zeros(())
+        kl_c = target.new_zeros(())
+        kl_s = target.new_zeros(())
+        inv_l = target.new_zeros(())
+        cyc_l = target.new_zeros(())
+        perc_l = target.new_zeros(())
+        g_adv = target.new_zeros(())
+        # (fake_detached, real_target, modality_idx, sample_mask) for the D step
+        fakes: list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]] = []
+
+        for j in range(m):
+            pj = present[:, j]
+            tgt_j = target[:, j : j + 1]
+            # self-reconstruction with the modality's own (encoded) style
+            rec_jj = self.model.decode_one(zs[j], enc.style[:, j])
+            recon_l = recon_l + self._vol_l1(rec_jj, tgt_j, pj)
+            kl_c = kl_c + self._kl_content(enc.content_mu[:, j], enc.content_logvar[:, j], pj)
+            kl_s = kl_s + _masked_mean(enc.style[:, j].pow(2).mean(dim=1), pj)
+            if self.perceptual is not None:
+                perc_l = perc_l + self._perc(rec_jj, tgt_j, pj)
+
+        for j in range(m):
+            for k in range(m):
+                if k == j:
+                    continue
+                pjk = present[:, j] * present[:, k]
+                tgt_k = target[:, k : k + 1]
+                # translate j -> k using k's PROTOTYPE style (the inference path)
+                proto_k = self.model.style_prototype(k, b, target.device)
+                fake_k = self.model.decode_one(zs[j], proto_k)
+                cross_l = cross_l + self._vol_l1(fake_k, tgt_k, pjk)
+                if self.perceptual is not None:
+                    perc_l = perc_l + self._perc(fake_k, tgt_k, pjk)
+                # style-cycle: the synthesized k must read back as prototype-k style
+                if self.style_cycle_weight > 0:
+                    s_rec = self.model.encode_style_one(fake_k)
+                    cyc = (s_rec - proto_k).abs().mean(dim=1)
+                    cyc_l = cyc_l + _masked_mean(cyc, pjk)
+                if adv_w > 0 and self.discriminator is not None:
+                    g_adv = g_adv + self._hinge_g(self.discriminator(fake_k, k), pjk)
+                fakes.append((fake_k.detach(), tgt_k, k, pjk))
+
+        # content-invariance: per-modality content means must agree for a subject.
+        # L2 in latent space, one branch detached (lower-variance pull to consensus).
+        for j in range(m):
+            for k in range(j + 1, m):
+                pjk = present[:, j] * present[:, k]
+                diff = (
+                    (enc.content_mu[:, j] - enc.content_mu[:, k].detach())
+                    .pow(2)
+                    .flatten(1)
+                    .mean(dim=1)
+                )
+                inv_l = inv_l + _masked_mean(diff, pjk)
+
+        kl_term = beta * self.model.beta_kl * kl_c + self.kl_style_weight * kl_s
+        g_total = (
+            self.recon_weight * recon_l
+            + self.cross_weight * cross_l
+            + self.content_invariance_weight * inv_l
+            + self.style_cycle_weight * cyc_l
+            + self.perceptual_weight * perc_l
+            + kl_term
+            + adv_w * g_adv
+        )
+        logs = {
+            "recon_l1": recon_l.detach(),
+            "cross_l1": cross_l.detach(),
+            "kl_content": kl_c.detach(),
+            "kl_style": kl_s.detach(),
+            "content_inv": inv_l.detach(),
+            "style_cycle": cyc_l.detach(),
+            "perceptual": perc_l.detach(),
+            "g_adv": g_adv.detach(),
+            "kl_beta": torch.tensor(beta),
+            "adv_weight": torch.tensor(adv_w),
+        }
+        return g_total, logs, fakes
+
+    def training_step(self, batch: dict[str, Any], batch_idx: int) -> None:
+        target = batch.get("target", batch["image"])
+        present = batch["present_mask"]
+
+        opts = self.optimizers()
+        opt_g, opt_d = (opts[0], opts[1]) if isinstance(opts, (list, tuple)) else (opts, None)
+
+        # --- generator step (discriminator frozen so DDP expects no D grads) ---
+        if self.discriminator is not None:
+            _set_requires_grad(self.discriminator, False)
+        _set_requires_grad(self.model, True)
+        g_total, logs, fakes = self._generator_losses(target, present)
+        opt_g.zero_grad(set_to_none=True)
+        self.manual_backward(g_total)
+        self.clip_gradients(opt_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+        opt_g.step()
+
+        # --- discriminator step (generator frozen; fakes already detached) ---
+        d_loss = target.new_zeros(())
+        if opt_d is not None and self.discriminator is not None and self._adv_weight() > 0:
+            _set_requires_grad(self.model, False)
+            _set_requires_grad(self.discriminator, True)
+            for fake_k, real_k, k, pjk in fakes:
+                real_logits = self.discriminator(real_k, k)
+                fake_logits = self.discriminator(fake_k, k)
+                d_loss = d_loss + self._hinge_d(real_logits, fake_logits, pjk)
+            d_loss = d_loss / max(1, len(fakes))
+            opt_d.zero_grad(set_to_none=True)
+            self.manual_backward(d_loss)
+            self.clip_gradients(opt_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            opt_d.step()
+            _set_requires_grad(self.model, True)
+
+        # step the generator LR schedule (per optimizer step)
+        sched = self.lr_schedulers()
+        if sched is not None:
+            sched_g = sched[0] if isinstance(sched, (list, tuple)) else sched
+            sched_g.step()
+
+        self._step_count += 1
+        bs = target.shape[0]
+        self.log(
+            "train/g_total", g_total, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs
+        )
+        self.log("train/d_loss", d_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+        for name, val in logs.items():
+            self.log(f"train/{name}", val, on_step=False, on_epoch=True, batch_size=bs)
+
+    @torch.no_grad()
+    def validation_step(self, batch: dict[str, Any], batch_idx: int) -> None:
+        target = batch.get("target", batch["image"])
+        present = batch["present_mask"]
+        # self-recon loss (all present modalities fed) as the monitored val signal
+        out = self.model(target * present.view(*present.shape, 1, 1, 1), present)
+        recon = _masked_l1(out.recon, target, present)
+        self.log("val/loss", recon, prog_bar=True, on_epoch=True, batch_size=target.shape[0])
+        self._log_xmodal_psnr(target, present)
+
+    @torch.no_grad()
+    def _log_xmodal_psnr(self, target: torch.Tensor, present: torch.Tensor) -> None:
+        """Live cross-modal synthesis PSNR per (src->dst) — the headline capability.
+
+        Validation-only (extra decodes are too costly per train step) and sync-light:
+        one device->host copy at the end, no per-sample `.item()`. Per-rank-local
+        under DDP; scripts/eval.py is the canonical single-process number.
+        """
+        b, m = present.shape
+        for src in range(m):
+            for dst in range(m):
+                if src == dst:
+                    continue
+                fake = self.model.translate(target[:, src : src + 1], src, dst)
+                mse = (fake[:, 0] - target[:, dst]).pow(2).flatten(1).mean(dim=1)
+                dr = target[:, dst].flatten(1).amax(dim=1).clamp_min(1e-6)
+                psnr = 10.0 * torch.log10(dr.pow(2) / mse.clamp_min(1e-12))  # (B,)
+                sel = present[:, src] * present[:, dst]
+                pooled = (psnr * sel).sum() / sel.sum().clamp_min(1.0)
+                self.log(
+                    f"val/xpsnr_{self.model.modalities[src]}_to_{self.model.modalities[dst]}",
+                    pooled,
+                    on_epoch=True,
+                    batch_size=b,
+                )
+
+    def configure_optimizers(self) -> Any:
+        opt_g = self.optimizer_partial(self.model.parameters())
+        optimizers: list[Any] = [opt_g]
+        if self.use_adversarial and self.discriminator is not None:
+            opt_d = torch.optim.Adam(
+                self.discriminator.parameters(), lr=self.disc_lr, betas=(0.5, 0.9)
+            )
+            optimizers.append(opt_d)
+        if self.scheduler_partial is None:
+            return optimizers
+        scheduler = self.scheduler_partial(opt_g)
+        total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
+        if total_steps and hasattr(scheduler, "T_max"):
+            scheduler.T_max = int(total_steps)
+        # Manual optimization: return the scheduler instance and step it ourselves
+        # in training_step (Lightning won't auto-step in manual mode).
+        return optimizers, [scheduler]
