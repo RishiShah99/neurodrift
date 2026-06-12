@@ -187,9 +187,19 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.groups)
 
-    def _load_volume(self, url: str) -> tuple[np.ndarray, dict[str, Any]]:
-        root = zarr.open(url, mode="r")
-        return np.asarray(root["data"], dtype=np.float32), dict(root.attrs)
+    def _load_volume(self, url: str) -> tuple[np.ndarray, dict[str, Any]] | None:
+        """Load a zarr store, or return None if it is missing/partial/corrupt.
+
+        A store whose write was interrupted (spot preemption mid-upload) can exist
+        without its `data` array; reading it raises KeyError. One such store must
+        not crash a dataloader worker (which kills a DDP rank and hangs the whole
+        run on the NCCL barrier) — treat it as an absent modality instead.
+        """
+        try:
+            root = zarr.open(url, mode="r")
+            return np.asarray(root["data"], dtype=np.float32), dict(root.attrs)
+        except (KeyError, ValueError, OSError, RuntimeError):
+            return None
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         group = self.groups[idx]
@@ -220,7 +230,10 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
             url = group.scans_by_modality.get(modality)
             if url is None:
                 continue
-            vol, attrs = self._load_volume(url)
+            loaded = self._load_volume(url)
+            if loaded is None:
+                continue  # partial/corrupt store -> treat this modality as absent
+            vol, attrs = loaded
             vol = _random_crop_or_pad(vol, self.image_size, random.Random(crop_seed))
             target[i] = _zscore(vol)
             present_mask[i] = 1.0

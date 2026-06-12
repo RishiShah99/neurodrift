@@ -128,6 +128,37 @@ def test_synth_dropout_keeps_single_input_modality(fake_zarr_root: Path) -> None
             assert s["target"][kept].abs().sum() > 0.0, "held-out modalities stay in target"
 
 
+def test_corrupt_zarr_store_treated_as_absent(tmp_path: Path) -> None:
+    """A partial/corrupt store (no `data` array) must not crash the worker.
+
+    Regression for a DDP-killing crash: a write interrupted mid-upload leaves a
+    zarr group without its `data` array; reading raised KeyError in a dataloader
+    worker, killing a rank and hanging the run on the NCCL barrier. The store
+    must instead be treated as an absent modality.
+    """
+    from neurodrift.train.data_module import SubjectGroup, ZarrMultimodalDataset
+
+    good = tmp_path / "sub-001_T1w.zarr"
+    r = zarr.open(str(good), mode="w")
+    # non-constant volume so the z-score isn't degenerate (constant -> std 0 -> all 0)
+    ramp = (np.arange(40 * 40 * 40, dtype=np.float32).reshape(40, 40, 40) + 1.0)
+    r.create_dataset("data", shape=ramp.shape, dtype=np.float32, overwrite=True)[...] = ramp
+    bad = tmp_path / "sub-001_T2w.zarr"
+    zarr.open(str(bad), mode="w")  # group with NO `data` array — the partial-store case
+
+    grp = SubjectGroup(
+        cohort="c",
+        subject="sub-001",
+        session=None,
+        scans_by_modality={"T1w": str(good), "T2w": str(bad)},
+    )
+    ds = ZarrMultimodalDataset([grp], ["T1w", "T2w", "PDw", "dwi"], image_size=32, train=False)
+    s = ds[0]
+    assert s["present_mask"][0].item() == 1.0, "good T1w store must load"
+    assert s["present_mask"][1].item() == 0.0, "corrupt T2w store must be treated as absent"
+    assert s["target"][0].abs().sum() > 0.0
+
+
 def test_crop_window_shared_across_modalities(fake_zarr_root: Path) -> None:
     """Every modality of a subject must be cropped with the IDENTICAL window.
 
