@@ -208,12 +208,20 @@ class ZarrMultimodalDataset(Dataset[dict[str, Any]]):
             "nan"
         )  # Phase-2 conditioning hook; read from Zarr attrs if preprocessing wrote it.
 
+        # One crop window per subject: every modality is MNI-registered onto the
+        # same grid, so they must be cropped with the IDENTICAL window or the
+        # cross-modal pairs are voxel-misaligned (T2 target spatially shifted vs
+        # the T1 input) and the 1->N synthesis objective trains on shifted targets.
+        # Seed drawn from `rng`, so train still re-randomizes the window per epoch
+        # (shared across modalities) while val stays deterministic.
+        crop_seed = rng.randrange(2**31)
+
         for i, modality in enumerate(self.modalities):
             url = group.scans_by_modality.get(modality)
             if url is None:
                 continue
             vol, attrs = self._load_volume(url)
-            vol = _random_crop_or_pad(vol, self.image_size, rng)
+            vol = _random_crop_or_pad(vol, self.image_size, random.Random(crop_seed))
             target[i] = _zscore(vol)
             present_mask[i] = 1.0
             if math.isnan(age) and attrs.get("age") not in (None, ""):

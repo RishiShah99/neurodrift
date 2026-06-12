@@ -66,8 +66,11 @@ class _TriOrthoVGGPerceptual(nn.Module):
             p.requires_grad = False
         self.features.eval()
 
-    @torch.no_grad()
     def _to_rgb_slice(self, vol: torch.Tensor, axis: int) -> torch.Tensor:
+        # NOT @torch.no_grad(): this is the only path from `recon` into the VGG
+        # features, so detaching it here makes the perceptual term a constant with
+        # zero gradient. VGG weights are already frozen via requires_grad=False on
+        # self.features.parameters(), so the gradient flows to recon but not VGG.
         mid = vol.shape[axis + 2] // 2
         if axis == 0:
             s = vol[:, :, mid, :, :]

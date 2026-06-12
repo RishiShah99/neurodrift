@@ -128,6 +128,57 @@ def test_synth_dropout_keeps_single_input_modality(fake_zarr_root: Path) -> None
             assert s["target"][kept].abs().sum() > 0.0, "held-out modalities stay in target"
 
 
+def test_crop_window_shared_across_modalities(fake_zarr_root: Path) -> None:
+    """Every modality of a subject must be cropped with the IDENTICAL window.
+
+    Regression for cross-modal voxel-misalignment: the fixture writes the same
+    RandomState(0) volume for both T1w and T2w, so an aligned crop yields equal
+    target slots. A per-modality crop offset (the bug) would shift them apart and
+    train the 1->N synthesis objective on misaligned pairs. Uses train_ds to
+    exercise the train-mode (seed=None) crop path.
+    """
+    from neurodrift.train.data_module import ZarrMultimodalDataModule
+
+    dm = ZarrMultimodalDataModule(
+        zarr_root=str(fake_zarr_root),
+        cohorts=["ixi"],
+        modalities=["T1w", "T2w", "PDw", "dwi"],
+        image_size=32,  # < the 40^3 fixture volume, so a real crop happens
+        batch_size=2,
+        num_workers=0,
+        val_fraction=0.5,
+        modality_dropout_p=0.0,
+    )
+    dm.setup()
+    ds = dm.train_ds
+    assert ds is not None
+    checked = False
+    for idx in range(len(ds)):
+        s = ds[idx]
+        present, target = s["present_mask"], s["target"]
+        if present[0] == 1.0 and present[1] == 1.0:
+            assert torch.equal(target[0], target[1]), (
+                "identical-content modalities must share one crop window (aligned)"
+            )
+            checked = True
+    assert checked, "fixture never produced a subject with both T1w and T2w"
+
+
+def test_perceptual_loss_carries_gradient() -> None:
+    """The perceptual term must backprop into recon (it was dead under no_grad)."""
+    pytest.importorskip("torchvision")
+    from neurodrift.train.lightning_module import _TriOrthoVGGPerceptual
+
+    perc = _TriOrthoVGGPerceptual()
+    recon = torch.randn(1, 3, 16, 16, 16, requires_grad=True)
+    target = torch.randn(1, 3, 16, 16, 16)
+    loss = perc(recon, target)
+    loss.backward()
+    assert recon.grad is not None and recon.grad.abs().sum().item() > 0.0, (
+        "perceptual loss produced no gradient on recon"
+    )
+
+
 def test_target_drives_masked_l1_for_dropped_modality() -> None:
     """A dropped-but-acquired modality must yield a real (nonzero-target) recon loss.
 
