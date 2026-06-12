@@ -157,12 +157,19 @@ class VAELitModule(L.LightningModule):
         cohorts: list[str],
         stage: str,
     ) -> None:
-        per_cohort: dict[str, list[torch.Tensor]] = defaultdict(list)
         b, m = present_mask.shape
+        # Vectorize PSNR per (sample, modality) and do a SINGLE device->host copy,
+        # instead of B*M `.item()` syncs (each serializes the GPU step).
+        mse = (recon - target).pow(2).mean(dim=(2, 3, 4))  # (B, M)
+        data_range = target.abs().amax(dim=(2, 3, 4)).clamp_min(1e-6)  # (B, M)
+        psnr = 10.0 * torch.log10(data_range.pow(2) / mse.clamp_min(1e-12))  # (B, M)
+        psnr_cpu = psnr.detach().cpu()
+        present_cpu = present_mask.detach().bool().cpu()
+        per_cohort: dict[str, list[torch.Tensor]] = defaultdict(list)
         for i in range(b):
             for j in range(m):
-                if present_mask[i, j] == 1.0:
-                    per_cohort[cohorts[i]].append(_psnr(recon[i, j], target[i, j]))
+                if present_cpu[i, j]:
+                    per_cohort[cohorts[i]].append(psnr_cpu[i, j])
         for cohort, vals in per_cohort.items():
             mean_psnr = torch.stack(vals).mean()
             self.log(

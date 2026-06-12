@@ -147,7 +147,7 @@ def test_skullstrip_uses_scan_modality(tmp_path: Path, monkeypatch: pytest.Monke
     T1 model, so T2w/FLAIR volumes were masked with the wrong contrast model.
     """
     from neurodrift.data.bids import Scan
-    from neurodrift.data.preprocess import SkullStripStep
+    from neurodrift.data.preprocess import RegisterStep, SkullStripStep
 
     seen: set[str] = set()
 
@@ -162,6 +162,11 @@ def test_skullstrip_uses_scan_modality(tmp_path: Path, monkeypatch: pytest.Monke
         src = tmp_path / f"sub-001_{mod}.nii.gz"
         nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), np.eye(4)), str(src))
         scan = Scan(subject="sub-001", session=None, modality=mod, path=src)  # type: ignore[arg-type]
+        # SkullStripStep now requires its predecessor (01_register) to exist
+        # rather than silently falling back to the raw scan.
+        reg_out = work / RegisterStep.name / f"{scan.stem}.nii.gz"
+        reg_out.parent.mkdir(parents=True, exist_ok=True)
+        nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), np.eye(4)), str(reg_out))
         SkullStripStep().run(scan, work)
 
     assert seen == {"T1w", "T2w", "FLAIR"}, "skull-strip must receive each scan's modality"
