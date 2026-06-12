@@ -7,7 +7,10 @@ devices: 8
 # this; the requires_grad toggle in the module already avoids most of it, this is the
 # belt-and-suspenders for any block that goes unused on a given batch (e.g. T1-only).
 strategy: ddp_find_unused_parameters_true
-max_epochs: 300
+# ~290 steps/epoch at ~24 steps/min → 100 epochs ≈ 29k steps ≈ ~20h, which lets the
+# cosine LR actually anneal to eta_min inside the run AND gives the adversarial ramp
+# (done by step 16k) ~45 epochs of refinement after. 300 would never finish annealing.
+max_epochs: 100
 precision: bf16-mixed
 # NO gradient_clip_val here: Lightning forbids Trainer-level clipping under manual
 # optimization (automatic_optimization=False). The module clips both optimizers

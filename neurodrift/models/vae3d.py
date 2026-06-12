@@ -482,29 +482,29 @@ class DisentangledVAE3D(nn.Module):
         return self.decoder(content, style)
 
     # -- structured encode for the disentanglement losses -------------------
-    def encode_all(self, x: torch.Tensor, present_mask: torch.Tensor) -> DisentangledOutput:
-        """Per-modality content + style for every slot. Absent slots are zero.
+    def encode_all(
+        self, x: torch.Tensor, present_mask: torch.Tensor | None = None
+    ) -> DisentangledOutput:
+        """Per-modality content + style for EVERY slot (absent slots from zeros).
 
-        `x`: (B, M, D, H, W) — full-fidelity volumes (the loss caller passes the
-        clean `target`, masking happens by which slots it then uses). `present_mask`
-        only gates which slots are computed to save compute.
+        `x`: (B, M, D, H, W). `present_mask` is accepted for call-site compatibility
+        but intentionally does NOT gate computation: every slot's stem + content +
+        style encoder runs every call so the autograd graph is IDENTICAL on every
+        DDP rank regardless of each rank's modality mix. Gating on presence (the
+        previous behaviour) made per-modality stems used on some ranks and not
+        others, so `find_unused_parameters` could never agree across ranks and the
+        all-reduce deadlocked (8 GPUs spinning at 100%, step frozen). The loss
+        caller masks absent slots out, so always-encode is free of correctness cost.
         """
         b, m = x.shape[0], x.shape[1]
         if m != self.num_modalities:
             raise ValueError(f"expected {self.num_modalities} modality channels, got {m}")
-        any_present = present_mask.any(dim=0)  # (M,) compute a slot if anyone has it
         mus: list[torch.Tensor] = []
         logvars: list[torch.Tensor] = []
         styles: list[torch.Tensor] = []
         for j in range(m):
-            if bool(any_present[j]):
-                mu_j, logvar_j = self.encode_content_one(x[:, j : j + 1], j)
-                s_j = self.encode_style_one(x[:, j : j + 1])
-            else:
-                d = x.shape[2] // (2 ** (len(self.channel_mults) - 1))
-                mu_j = x.new_zeros(b, self.latent_channels, d, d, d)
-                logvar_j = x.new_zeros(b, self.latent_channels, d, d, d)
-                s_j = x.new_zeros(b, self.style_dim)
+            mu_j, logvar_j = self.encode_content_one(x[:, j : j + 1], j)
+            s_j = self.encode_style_one(x[:, j : j + 1])
             mus.append(mu_j)
             logvars.append(logvar_j)
             styles.append(s_j)
