@@ -92,6 +92,7 @@ def _process_cohort(
     template: Path,
     workers: int,
     force: bool,
+    modalities: frozenset[str] = _COOK_MODALITIES,
 ) -> tuple[int, int]:
     log.info("=== %s: download raw → scratch ===", cohort)
     raw_root = _download_raw_cohort(bucket, cohort, scratch / "raw")
@@ -99,11 +100,11 @@ def _process_cohort(
     work_dir = scratch / "work" / cohort
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Only preprocess the structural modalities the VAE consumes. The fetcher
-    # also pulls dwi/ (large 4D DTI volumes) which the model never reads;
-    # processing them would burn CPU/disk on intermediates the cook ignores.
-    scans = [s for s in iter_bids(raw_root) if s.modality in _COOK_MODALITIES]
-    log.info("%s: found %d structural scans (T1w/T2w/FLAIR) in BIDS layout", cohort, len(scans))
+    # Only preprocess the requested structural modalities. The fetcher also pulls
+    # dwi/ (large 4D DTI) which the model never reads; and `--modalities` lets us
+    # regenerate just T2w/FLAIR (e.g. after a skull-strip fix) without redoing T1.
+    scans = [s for s in iter_bids(raw_root) if s.modality in modalities]
+    log.info("%s: found %d scans for %s in BIDS layout", cohort, len(scans), sorted(modalities))
 
     cached = set() if force else _existing_zarr_stems(bucket, cohort)
     todo: list[Scan] = [scan for scan in scans if scan.stem not in cached]
@@ -147,7 +148,13 @@ def main() -> int:
     )
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--modalities",
+        default="T1w,T2w,FLAIR",
+        help="Comma-sep subset of T1w,T2w,FLAIR to process (default: all).",
+    )
     args = parser.parse_args()
+    modalities = frozenset(m.strip() for m in args.modalities.split(",") if m.strip())
 
     logging.basicConfig(
         level=logging.INFO,
@@ -171,6 +178,7 @@ def main() -> int:
             template=template,
             workers=args.workers,
             force=args.force,
+            modalities=modalities,
         )
         total_ok += ok
         total_fail += fail
