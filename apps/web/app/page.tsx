@@ -5,12 +5,12 @@ import { Controls } from "@/components/Controls";
 import { DropZone } from "@/components/DropZone";
 import { RegionPanel } from "@/components/RegionPanel";
 import { Viewer } from "@/components/Viewer";
-import type { InferResponse, Treatment } from "@/lib/types";
+import type { Apoe, InferResponse, Treatment } from "@/lib/types";
 
 export default function HomePage() {
   const [file, setFile] = useState<File | null>(null);
   const [age, setAge] = useState(60);
-  const [apoe, setApoe] = useState<"E2E2" | "E3E3" | "E3E4" | "E4E4">("E3E3");
+  const [apoe, setApoe] = useState<Apoe>("E3E3");
   const [treatment, setTreatment] = useState<Treatment>("placebo");
   const [response, setResponse] = useState<InferResponse | null>(null);
   const [loading, setLoading] = useState(false);

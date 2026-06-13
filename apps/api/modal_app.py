@@ -57,6 +57,7 @@ def infer(
     """
     import numpy as np
 
+    # Keep this baseline in sync with the Next.js stub (apps/web/app/api/infer/route.ts).
     age_now = 60.0
     n = 24
     ages = np.linspace(age_now, age_target, n)

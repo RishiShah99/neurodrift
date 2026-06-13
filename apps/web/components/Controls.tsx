@@ -3,7 +3,7 @@
 import * as Slider from "@radix-ui/react-slider";
 import * as Select from "@radix-ui/react-select";
 import { ChevronDown, Play, Loader2 } from "lucide-react";
-import type { Treatment } from "@/lib/types";
+import type { Apoe, Treatment } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const TREATMENTS: { value: Treatment; label: string }[] = [
@@ -15,13 +15,13 @@ const TREATMENTS: { value: Treatment; label: string }[] = [
   { value: "glp1", label: "GLP-1 (class)" },
 ];
 
-const APOE = ["E2E2", "E2E3", "E3E3", "E3E4", "E4E4"] as const;
+const APOE: readonly Apoe[] = ["E2E2", "E2E3", "E3E3", "E3E4", "E4E4"];
 
 interface Props {
   age: number;
   setAge: (v: number) => void;
-  apoe: (typeof APOE)[number];
-  setApoe: (v: (typeof APOE)[number]) => void;
+  apoe: Apoe;
+  setApoe: (v: Apoe) => void;
   treatment: Treatment;
   setTreatment: (v: Treatment) => void;
   onRun: () => void;

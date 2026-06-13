@@ -31,7 +31,8 @@ export async function POST(req: Request): Promise<Response> {
   const apoe = String(fd.get("apoe") ?? "E3E3");
   const treatment = String(fd.get("treatment") ?? "placebo") as Treatment;
 
-  const ageNow = 58;
+  // Keep this baseline in sync with the Modal stub (apps/api/modal_app.py: age_now).
+  const ageNow = 60;
   const n = 24;
   const ages = Array.from({ length: n }, (_, i) => ageNow + ((ageTarget - ageNow) * i) / (n - 1));
   const rate = APOE_RATE[apoe] ?? 1.0;
