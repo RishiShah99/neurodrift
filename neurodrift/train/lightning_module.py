@@ -12,7 +12,6 @@ under the pooled average.
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 from typing import Any
 
@@ -38,12 +37,28 @@ def _kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
 
-def _psnr(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    mse = F.mse_loss(pred, target)
-    if mse.item() <= 0:
-        return torch.tensor(99.0, device=pred.device)
-    data_range = target.abs().max().clamp_min(1e-6)
-    return 10.0 * torch.log10(data_range.pow(2) / mse)
+def _skip_step_if_nonfinite(module: L.LightningModule, optimizer: Any) -> bool:
+    """Zero the grads (making the optimizer step a no-op) if ANY are non-finite.
+
+    A single NaN/Inf gradient on one rank is all-reduced into EVERY rank's grads and
+    poisons all weights. By the time this runs, backward and the DDP all-reduce have
+    already completed in lockstep, so every rank sees the same (post-reduce) grads
+    and makes the same skip decision — no NCCL desync (unlike returning None from
+    training_step, which would skip backward on only one rank and hang the others).
+    One host sync (the finiteness check), not the per-step loss.item() it replaces.
+    Returns True when the step was skipped.
+    """
+    sq = [
+        p.grad.detach().pow(2).sum()
+        for p in module.parameters()
+        if p.requires_grad and p.grad is not None
+    ]
+    if not sq:
+        return False
+    if bool(torch.isfinite(torch.stack(sq).sum())):
+        return False
+    optimizer.zero_grad(set_to_none=True)
+    return True
 
 
 class _TriOrthoVGGPerceptual(nn.Module):
@@ -52,15 +67,36 @@ class _TriOrthoVGGPerceptual(nn.Module):
     Cheap perceptual loss that works without a med-imaging-specific backbone.
     Swap in Med3D-VGG once weights are downloaded by setting `model` to
     something with the same `features` interface.
+
+    `weights` is passed straight to `torchvision.models.vgg19`. It MUST be the
+    pretrained tag ("DEFAULT"/"IMAGENET1K_V1") for this to be a real perceptual
+    signal: an untrained VGG (`weights=None`) is ~a random projection, so the term
+    silently degrades to noise — a high-impact bug for a model whose whole job is to
+    beat a blur ceiling. `None` is retained only for tests (no 550 MB download).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, weights: str | None = "DEFAULT") -> None:
         super().__init__()
         try:
             from torchvision import models
         except ImportError as err:
             raise RuntimeError("torchvision required for perceptual loss") from err
-        vgg = models.vgg19(weights=None)
+        try:
+            vgg = models.vgg19(weights=weights)
+        except Exception as err:  # offline box: download of the pretrained tag failed
+            if weights is None:
+                raise
+            import warnings
+
+            warnings.warn(
+                f"vgg19(weights={weights!r}) failed to load ({err}); falling back to "
+                "RANDOM features. The perceptual loss is now ~meaningless — pre-download "
+                'the weights (python -c "import torchvision; '
+                "torchvision.models.vgg19(weights='DEFAULT')\") or set use_perceptual=false.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            vgg = models.vgg19(weights=None)
         self.features = vgg.features[:16]
         for p in self.features.parameters():
             p.requires_grad = False
@@ -107,6 +143,7 @@ class VAELitModule(L.LightningModule):
         perceptual_weight: float = 0.1,
         cycle_weight: float = 0.5,
         use_perceptual: bool = True,
+        perceptual_weights: str | None = "DEFAULT",
     ) -> None:
         super().__init__()
         self.model = model
@@ -116,7 +153,9 @@ class VAELitModule(L.LightningModule):
         self.perceptual_weight = perceptual_weight
         self.cycle_weight = cycle_weight
         self.use_perceptual = use_perceptual
-        self.perceptual: nn.Module | None = _TriOrthoVGGPerceptual() if use_perceptual else None
+        self.perceptual: nn.Module | None = (
+            _TriOrthoVGGPerceptual(weights=perceptual_weights) if use_perceptual else None
+        )
 
     def forward(self, x: torch.Tensor, modality_mask: torch.Tensor | None = None) -> torch.Tensor:
         return self.model(x, modality_mask).recon
@@ -219,9 +258,14 @@ class VAELitModule(L.LightningModule):
         self.log(f"{stage}/perceptual", perc_loss, on_epoch=True, batch_size=bs)
         self.log(f"{stage}/cycle", cycle, on_epoch=True, batch_size=bs)
 
-        if not math.isnan(loss.item()):
-            self._log_per_cohort_psnr(out.recon, target, present_mask, cohorts, stage)
+        # No NaN gate here: a non-finite step is caught in on_before_optimizer_step
+        # (which zeroes the grads), and gating PSNR on loss.item() would add a
+        # per-step host sync. A rare NaN batch only pollutes that epoch's PSNR mean.
+        self._log_per_cohort_psnr(out.recon, target, present_mask, cohorts, stage)
         return loss
+
+    def on_before_optimizer_step(self, optimizer: Any) -> None:
+        _skip_step_if_nonfinite(self, optimizer)
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         return self._step(batch, "train")
@@ -299,6 +343,7 @@ class DisentangledVAELitModule(L.LightningModule):
         disc_base_channels: int = 32,
         use_perceptual: bool = True,
         use_adversarial: bool = True,
+        perceptual_weights: str | None = "DEFAULT",
     ) -> None:
         super().__init__()
         # Automatic optimization (Lightning drives backward/step/clip/sched) when
@@ -324,7 +369,9 @@ class DisentangledVAELitModule(L.LightningModule):
         self.disc_lr = disc_lr
         self.use_perceptual = use_perceptual
         self.use_adversarial = use_adversarial
-        self.perceptual: nn.Module | None = _TriOrthoVGGPerceptual() if use_perceptual else None
+        self.perceptual: nn.Module | None = (
+            _TriOrthoVGGPerceptual(weights=perceptual_weights) if use_perceptual else None
+        )
         self.discriminator: PatchDiscriminator3D | None = (
             PatchDiscriminator3D(model.num_modalities, base_channels=disc_base_channels)
             if use_adversarial
@@ -389,7 +436,7 @@ class DisentangledVAELitModule(L.LightningModule):
         self, target: torch.Tensor, present: torch.Tensor
     ) -> tuple[
         torch.Tensor,
-        dict[str, torch.Tensor],
+        dict[str, torch.Tensor | float],
         list[tuple[torch.Tensor, torch.Tensor, int, torch.Tensor]],
     ]:
         b, m = present.shape
@@ -467,7 +514,7 @@ class DisentangledVAELitModule(L.LightningModule):
             + kl_term
             + adv_w * g_adv
         )
-        logs = {
+        logs: dict[str, torch.Tensor | float] = {
             "recon_l1": recon_l.detach(),
             "cross_l1": cross_l.detach(),
             "kl_content": kl_c.detach(),
@@ -476,8 +523,11 @@ class DisentangledVAELitModule(L.LightningModule):
             "style_cycle": cyc_l.detach(),
             "perceptual": perc_l.detach(),
             "g_adv": g_adv.detach(),
-            "kl_beta": torch.tensor(beta),
-            "adv_weight": torch.tensor(adv_w),
+            # Plain Python floats, not torch.tensor(...): a bare CPU scalar tensor
+            # logged with on_epoch reduction in a CUDA DDP run triggers a device
+            # mismatch / needless sync. Lightning moves floats to the right device.
+            "kl_beta": beta,
+            "adv_weight": adv_w,
         }
         return g_total, logs, fakes
 
@@ -508,8 +558,12 @@ class DisentangledVAELitModule(L.LightningModule):
         g_total, logs, fakes = self._generator_losses(target, present)
         opt_g.zero_grad(set_to_none=True)
         self.manual_backward(g_total)
-        self.clip_gradients(opt_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-        opt_g.step()
+        # Manual opt: Lightning does NOT call on_before_optimizer_step, so guard the
+        # step inline. Skip (grads already zeroed) if non-finite so a NaN can't poison
+        # the generator. Check before clipping, which would mangle an inf norm to 0.
+        if not _skip_step_if_nonfinite(self, opt_g):
+            self.clip_gradients(opt_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+            opt_g.step()
 
         # --- discriminator step (generator frozen; fakes already detached) ---
         d_loss = target.new_zeros(())
@@ -523,8 +577,9 @@ class DisentangledVAELitModule(L.LightningModule):
             d_loss = d_loss / max(1, len(fakes))
             opt_d.zero_grad(set_to_none=True)
             self.manual_backward(d_loss)
-            self.clip_gradients(opt_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
-            opt_d.step()
+            if not _skip_step_if_nonfinite(self, opt_d):
+                self.clip_gradients(opt_d, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+                opt_d.step()
             _set_requires_grad(self.model, True)
 
         # step the generator LR schedule (per optimizer step)
@@ -541,6 +596,11 @@ class DisentangledVAELitModule(L.LightningModule):
         self.log("train/d_loss", d_loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
         for name, val in logs.items():
             self.log(f"train/{name}", val, on_step=False, on_epoch=True, batch_size=bs)
+
+    def on_before_optimizer_step(self, optimizer: Any) -> None:
+        # Fires only in automatic optimization (the no-GAN flagship). The manual GAN
+        # path guards its steps inline in training_step instead.
+        _skip_step_if_nonfinite(self, optimizer)
 
     @torch.no_grad()
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> None:

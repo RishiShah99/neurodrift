@@ -140,6 +140,7 @@ def _make_lit(use_adversarial: bool, use_perceptual: bool) -> DisentangledVAELit
         disc_base_channels=8,
         use_perceptual=use_perceptual,
         use_adversarial=use_adversarial,
+        perceptual_weights=None,  # random VGG: keep the CPU test offline (no download)
     )
 
 
@@ -160,6 +161,29 @@ def test_fast_dev_run_trains(use_adversarial: bool) -> None:
     )
     trainer.fit(lit, train_dataloaders=loader, val_dataloaders=loader)
     assert int(lit._step_count.item()) >= 1
+
+
+def test_nonfinite_grad_skip_zeros_grads() -> None:
+    """A non-finite gradient must zero ALL grads so the optimizer step is a no-op.
+
+    Regression for the NaN guard that only suppressed a log line: the poisoned loss
+    still ran backward. Under DDP a single NaN grad is all-reduced into every rank,
+    so the skip decision is made here (post-reduce, identical on all ranks) by
+    zeroing grads — never by returning None (which would desync ranks).
+    """
+    from neurodrift.train.lightning_module import _skip_step_if_nonfinite
+
+    lit = _make_lit(use_adversarial=False, use_perceptual=False)
+    opt = torch.optim.SGD(lit.parameters(), lr=0.1)
+    p = next(param for param in lit.parameters() if param.requires_grad)
+
+    p.grad = torch.ones_like(p)
+    assert _skip_step_if_nonfinite(lit, opt) is False, "finite grads must not be skipped"
+    assert p.grad is not None and torch.isfinite(p.grad).all()
+
+    p.grad = torch.full_like(p, float("nan"))
+    assert _skip_step_if_nonfinite(lit, opt) is True, "NaN grads must trigger a skip"
+    assert p.grad is None or float(p.grad.abs().sum()) == 0.0, "grads must be cleared on skip"
 
 
 def test_adversarial_ramp_schedule() -> None:
