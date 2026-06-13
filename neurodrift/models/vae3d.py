@@ -218,7 +218,10 @@ class VAE3D(nn.Module):
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         if not self.training:
             return mu
-        std = torch.exp(0.5 * logvar)
+        # Clamp logvar before exp (same bounds as DisentangledVAE3D): early in
+        # training, before the KL warmup bites, an unbounded logvar can make
+        # exp(0.5*logvar) overflow std to inf -> NaN reparameterized sample -> NaN loss.
+        std = torch.exp(0.5 * logvar.clamp(-30.0, 20.0))
         eps = torch.randn_like(std)
         return mu + eps * std
 
@@ -496,7 +499,7 @@ class DisentangledVAE3D(nn.Module):
         all-reduce deadlocked (8 GPUs spinning at 100%, step frozen). The loss
         caller masks absent slots out, so always-encode is free of correctness cost.
         """
-        b, m = x.shape[0], x.shape[1]
+        m = x.shape[1]
         if m != self.num_modalities:
             raise ValueError(f"expected {self.num_modalities} modality channels, got {m}")
         mus: list[torch.Tensor] = []

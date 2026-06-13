@@ -64,3 +64,16 @@ def test_eval_mode_is_deterministic(tiny_vae: VAE3D) -> None:
     out1 = tiny_vae(x)
     out2 = tiny_vae(x)
     assert torch.allclose(out1.recon, out2.recon)
+
+
+def test_reparameterize_clamps_large_logvar(tiny_vae: VAE3D) -> None:
+    """A large logvar must not overflow std to inf (clamp parity with DisentangledVAE3D).
+
+    In train mode an unbounded logvar makes exp(0.5*logvar) overflow before KL warmup
+    regularizes it, yielding a NaN sample and NaN loss.
+    """
+    tiny_vae.train()
+    mu = torch.zeros(1, 4, 8, 8, 8)
+    logvar = torch.full((1, 4, 8, 8, 8), 200.0)  # exp(100) is inf without the clamp
+    z = tiny_vae.reparameterize(mu, logvar)
+    assert torch.isfinite(z).all(), "reparameterized sample must stay finite for huge logvar"
