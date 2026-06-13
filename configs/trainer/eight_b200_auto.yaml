@@ -1,0 +1,17 @@
+_target_: lightning.Trainer
+
+accelerator: gpu
+devices: 8
+# Plain DDP (NOT find_unused): the no-GAN disentangled module uses automatic
+# optimization with a fully-used graph (encode_all touches every stem/encoder, all
+# decodes run), so every trainable param gets grad each step. This is the same
+# rock-solid path the v0 cook ran for 95 epochs — no manual-opt / discriminator /
+# find_unused fragility that deadlocked the GAN variant.
+strategy: ddp
+max_epochs: 100
+precision: bf16-mixed
+# Automatic optimization → Lightning applies the gradient clip.
+gradient_clip_val: 1.0
+log_every_n_steps: 50
+val_check_interval: 0.25
+fast_dev_run: false

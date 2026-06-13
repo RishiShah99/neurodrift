@@ -301,7 +301,13 @@ class DisentangledVAELitModule(L.LightningModule):
         use_adversarial: bool = True,
     ) -> None:
         super().__init__()
-        self.automatic_optimization = False
+        # Automatic optimization (Lightning drives backward/step/clip/sched) when
+        # there's no GAN — the rock-solid DDP path the v0 cook used. Manual
+        # optimization ONLY for the adversarial case, where two optimizers must
+        # alternate. The recon/disentangled objective needs neither, and forcing
+        # manual-opt + a discriminator + find_unused on the no-GAN path was the
+        # source of an intermittent DDP deadlock, so keep them decoupled.
+        self.automatic_optimization = not use_adversarial
         self.model = model
         self.optimizer_partial = optimizer_partial
         self.scheduler_partial = scheduler_partial
@@ -475,10 +481,23 @@ class DisentangledVAELitModule(L.LightningModule):
         }
         return g_total, logs, fakes
 
-    def training_step(self, batch: dict[str, Any], batch_idx: int) -> None:
+    def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor | None:
         target = batch.get("target", batch["image"])
         present = batch["present_mask"]
 
+        # --- automatic optimization (no GAN): just return the loss ---
+        if self.automatic_optimization:
+            g_total, logs, _ = self._generator_losses(target, present)
+            self._step_count += 1
+            bs = target.shape[0]
+            self.log(
+                "train/g_total", g_total, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs
+            )
+            for name, val in logs.items():
+                self.log(f"train/{name}", val, on_step=False, on_epoch=True, batch_size=bs)
+            return g_total
+
+        # --- manual optimization (GAN): two optimizers, alternating ---
         opts = self.optimizers()
         opt_g, opt_d = (opts[0], opts[1]) if isinstance(opts, (list, tuple)) else (opts, None)
 
@@ -559,20 +578,38 @@ class DisentangledVAELitModule(L.LightningModule):
                     batch_size=b,
                 )
 
-    def configure_optimizers(self) -> Any:
-        opt_g = self.optimizer_partial(self.model.parameters())
-        optimizers: list[Any] = [opt_g]
-        if self.use_adversarial and self.discriminator is not None:
-            opt_d = torch.optim.Adam(
-                self.discriminator.parameters(), lr=self.disc_lr, betas=(0.5, 0.9)
-            )
-            optimizers.append(opt_d)
+    def _build_scheduler(self, opt_g: Any) -> Any | None:
         if self.scheduler_partial is None:
-            return optimizers
+            return None
         scheduler = self.scheduler_partial(opt_g)
         total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
         if total_steps and hasattr(scheduler, "T_max"):
             scheduler.T_max = int(total_steps)
-        # Manual optimization: return the scheduler instance and step it ourselves
-        # in training_step (Lightning won't auto-step in manual mode).
+        return scheduler
+
+    def configure_optimizers(self) -> Any:
+        opt_g = self.optimizer_partial(self.model.parameters())
+
+        # --- automatic optimization (no GAN): standard optimizer + scheduler dict.
+        # Lightning steps the optimizer/scheduler and clips grads (Trainer config). ---
+        if self.automatic_optimization:
+            scheduler = self._build_scheduler(opt_g)
+            if scheduler is None:
+                return opt_g
+            return {
+                "optimizer": opt_g,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+            }
+
+        # --- manual optimization (GAN): two optimizers; we step the scheduler
+        # ourselves in training_step (Lightning won't auto-step in manual mode). ---
+        optimizers: list[Any] = [opt_g]
+        if self.discriminator is not None:
+            opt_d = torch.optim.Adam(
+                self.discriminator.parameters(), lr=self.disc_lr, betas=(0.5, 0.9)
+            )
+            optimizers.append(opt_d)
+        scheduler = self._build_scheduler(opt_g)
+        if scheduler is None:
+            return optimizers
         return optimizers, [scheduler]

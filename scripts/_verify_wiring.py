@@ -54,12 +54,18 @@ def check(experiment: str) -> None:
         f"use_perc={getattr(lit, 'use_perceptual', None)} "
         f"disc={'yes' if getattr(lit, 'discriminator', None) is not None else 'no'}"
     )
-    # Sanity: the manual-opt trainer must NOT set Trainer-level grad clipping.
+    # Sanity: grad-clip placement must match the optimization mode, and always 8 GPUs.
     if "DisentangledVAE" in type(lit).__name__:
-        assert lit.automatic_optimization is False, "expected manual optimization"
-        assert cfg.trainer.get("gradient_clip_val") in (None, 0, 0.0), (
-            "manual optimization forbids Trainer gradient_clip_val; clip inside the module"
-        )
+        grad_clip = cfg.trainer.get("gradient_clip_val")
+        if lit.automatic_optimization:
+            assert grad_clip not in (None, 0, 0.0), (
+                "automatic optimization needs Trainer gradient_clip_val set"
+            )
+        else:
+            assert grad_clip in (None, 0, 0.0), (
+                "manual optimization forbids Trainer gradient_clip_val; clip inside the module"
+            )
+        print(f"  opt_mode      = {'automatic' if lit.automatic_optimization else 'manual (GAN)'}")
         assert int(cfg.trainer.devices) == 8, "flagship must default to all 8 GPUs"
 
 
