@@ -14,3 +14,16 @@ experiment_name: vae_v0_disentangled_noadv
 
 litmodule:
   use_adversarial: false
+
+# Runtime cap. multimodal_oversample=8 DUPLICATES multimodal subjects 8x into the train
+# set (DDP-safe oversampling baked into the dataset), so an epoch is ~8x a single pass:
+# 23,513 train groups -> ~1,470 steps/epoch at batch 2 x 8 GPUs. ~20 of these fat epochs
+# already exceeds the multimodal (cross-modal) gradient updates of the old converged
+# 95-epoch run, and fits the originally-budgeted ~20h. (max_epochs=100 here is ~95h /
+# ~$4k on spot — do NOT.) T_max matches the 20-epoch step count so the cosine LR anneals
+# to eta_min exactly at the end. Rescale BOTH together if the corpus or oversample changes.
+trainer:
+  max_epochs: 20
+
+scheduler:
+  T_max: 29400
