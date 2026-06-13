@@ -25,6 +25,11 @@ litmodule:
   style_cycle_weight: 1.0
   kl_style_weight: 0.01
   perceptual_weight: 1.0
+  # Pretrained ImageNet VGG19 — NOT random init. A randomly-initialized VGG is ~a
+  # random projection, so the "perceptual" sharpness term would train against noise.
+  # Pre-download on the box before the multi-GPU cook (see HANDOFF) so 8 ranks don't
+  # race the torch-hub download; set null only to disable.
+  perceptual_weights: DEFAULT
   # Adversarial is zero for adv_start_step, then ramps over adv_warmup_steps — the
   # generator needs a head start or the 3D discriminator wins early and G's gradient
   # vanishes. SN on the critic keeps it from overpowering G.

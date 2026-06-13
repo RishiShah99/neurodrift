@@ -5,6 +5,7 @@ or a GPU. Not a test fixture — a one-off pre-flight before launching a cook.""
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -31,6 +32,13 @@ def check(experiment: str) -> None:
     lit_kwargs = OmegaConf.to_container(cfg.get("litmodule", {}), resolve=True) or {}
     lit_target = lit_kwargs.pop("_target_", None)
     lit_cls = get_class(lit_target)
+    # Force perceptual weights off for this CPU pre-flight so it NEVER downloads the
+    # 550 MB pretrained VGG (the real cook keeps the configured "DEFAULT"). Set it
+    # unconditionally whenever the LitModule accepts the kwarg: a config that omits
+    # the key (e.g. vae_v0) would otherwise fall back to the "DEFAULT" signature
+    # default and hang the offline pre-flight on a torch-hub download.
+    if "perceptual_weights" in inspect.signature(lit_cls).parameters:
+        lit_kwargs["perceptual_weights"] = None
     lit = lit_cls(
         model=model,
         optimizer_partial=optimizer_partial,
