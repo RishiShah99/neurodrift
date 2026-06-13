@@ -148,13 +148,21 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     # batch is wasted). Clip to ±_ZSCORE_CLIP std so pathological outlier voxels
     # can't swamp the loss; genuine anatomy is unaffected at 10 std.
     x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    nonzero = x[x > 0].astype(np.float64)
+    brain = x > 0
+    nonzero = x[brain].astype(np.float64)
     if nonzero.size < 100:
         return x
     mu = nonzero.mean()
     sd = nonzero.std() + 1e-6
     out = (x.astype(np.float64) - mu) / sd
     out = np.clip(out, -_ZSCORE_CLIP, _ZSCORE_CLIP)
+    # Re-zero the (skull-stripped) background. Z-scoring every voxel maps background
+    # 0 -> -mu/sd, so a present modality's background would be a nonzero constant
+    # while a dropped/absent input slot is exactly 0 — two different "empty" values
+    # the decoder must reconcile, and the spurious background plane also widens the
+    # per-volume data_range that PSNR/SSIM normalise by. Keep background at 0 so
+    # present, dropped, and absent slots all agree there.
+    out = np.where(brain, out, 0.0)
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
 
@@ -329,7 +337,16 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         refs: list[ScanRef] = []
         for cohort in self.cohorts:
             refs.extend(_list_zarr_stems(self.zarr_root, cohort))
-        return _group_by_subject(refs)
+        groups = _group_by_subject(refs)
+        # Sort to a canonical order BEFORE any seeded shuffle. `fs.ls` is unordered:
+        # the local cache (LocalFileSystem) uses os.scandir order, gcsfs uses
+        # lexicographic order, and scandir order isn't stable across machines or a
+        # re-cache. A seeded shuffle over an unordered list is therefore NOT
+        # reproducible, so scripts/eval.py could rebuild a DIFFERENT val split than
+        # the checkpoint was selected against. Sorting first makes the split
+        # identical everywhere.
+        groups.sort(key=lambda g: (g.cohort, g.subject, g.session or ""))
+        return groups
 
     def setup(self, stage: str | None = None) -> None:
         groups = self._discover()
@@ -339,10 +356,18 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
                 "run scripts/preprocess.py first"
             )
         rng = random.Random(self.seed)
-        rng.shuffle(groups)
-        n_val = max(1, int(len(groups) * self.val_fraction))
-        val_groups = groups[:n_val]
-        train_groups = groups[n_val:]
+        # Split on (cohort, subject), NOT on the per-session group: a subject with
+        # >=2 sessions (OpenNeuro has repeat scans) must land ENTIRELY in train or
+        # val. Splitting per session puts the same anatomy/scanner on both sides and
+        # inflates val recon and — worst — the headline cross-modal synthesis dB.
+        # Subjects are sorted (deterministic; `groups` is already canonically ordered)
+        # then shuffled with the seeded rng, so the split is reproducible and leak-free.
+        subjects = sorted({(g.cohort, g.subject) for g in groups})
+        rng.shuffle(subjects)
+        n_val = max(1, int(len(subjects) * self.val_fraction))
+        val_subjects = set(subjects[:n_val])
+        val_groups = [g for g in groups if (g.cohort, g.subject) in val_subjects]
+        train_groups = [g for g in groups if (g.cohort, g.subject) not in val_subjects]
         # Bake multimodal oversampling into the dataset by DUPLICATING multimodal
         # subject groups, instead of a WeightedRandomSampler. A custom sampler is
         # not safe under DDP — Lightning can't split it into even per-rank shards,
@@ -351,7 +376,7 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         # Duplicating groups keeps a plain map-style dataset, so Lightning's standard
         # DistributedSampler shards it evenly. Train re-randomizes the crop per access,
         # so duplicates are augmentations, not identical copies.
-        factor = max(1, int(round(self.multimodal_oversample)))
+        factor = max(1, round(self.multimodal_oversample))
         if factor > 1:
             expanded: list[SubjectGroup] = []
             for g in train_groups:

@@ -41,6 +41,91 @@ def fake_zarr_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+@pytest.fixture
+def multisession_zarr_root(tmp_path: Path) -> Path:
+    """10 subjects, each with TWO sessions (T1w+T2w) — the repeat-session case."""
+    cohort = tmp_path / "openneuro"
+    cohort.mkdir()
+    for i in range(10):
+        subj = f"sub-{i:03d}"
+        for sess in ("ses-01", "ses-02"):
+            for mod in ("T1w", "T2w"):
+                _write_zarr(
+                    cohort / f"{subj}_{sess}_{mod}.zarr",
+                    shape=(40, 40, 40),
+                    attrs={"subject": subj, "modality": mod},
+                )
+    return tmp_path
+
+
+def _val_subjects(dm: ZarrMultimodalDataModule) -> set[tuple[str, str]]:
+    assert dm.val_ds is not None
+    return {(g.cohort, g.subject) for g in dm.val_ds.groups}
+
+
+def _train_subjects(dm: ZarrMultimodalDataModule) -> set[tuple[str, str]]:
+    assert dm.train_ds is not None
+    return {(g.cohort, g.subject) for g in dm.train_ds.groups}
+
+
+def test_split_keeps_all_sessions_of_a_subject_on_one_side(
+    multisession_zarr_root: Path,
+) -> None:
+    """No subject may appear in BOTH train and val (cross-session leakage).
+
+    Regression for an inflated cross-modal dB: keying the split on
+    (cohort, subject, session) put one session of a repeat-scanned subject in train
+    and another in val — same anatomy, same scanner — so val scored partly on
+    training subjects. The split must be on (cohort, subject).
+    """
+    dm = ZarrMultimodalDataModule(
+        zarr_root=str(multisession_zarr_root),
+        cohorts=["openneuro"],
+        modalities=["T1w", "T2w", "PDw", "dwi"],
+        image_size=32,
+        batch_size=2,
+        num_workers=0,
+        val_fraction=0.3,
+        modality_dropout_p=0.0,
+    )
+    dm.setup()
+    val_subj, train_subj = _val_subjects(dm), _train_subjects(dm)
+    assert val_subj and train_subj, "both splits must be non-empty"
+    assert val_subj.isdisjoint(train_subj), "a subject leaked across train/val"
+    # every subject's BOTH sessions must be present on its assigned side
+    assert dm.val_ds is not None
+    val_sessions = [(g.subject, g.session) for g in dm.val_ds.groups]
+    for subj in {s for _, s in val_subj}:
+        assert sum(1 for s, _ in val_sessions if s == subj) == 2
+
+
+def test_val_split_is_deterministic_across_instances(
+    multisession_zarr_root: Path,
+) -> None:
+    """Same seed + config must yield the IDENTICAL val membership every time.
+
+    Regression for a non-reproducible split: the seeded shuffle ran over an
+    unordered fs.ls() listing, so eval.py could rebuild a different val set than
+    training used. Discovery now sorts to a canonical order first.
+    """
+
+    def build() -> ZarrMultimodalDataModule:
+        dm = ZarrMultimodalDataModule(
+            zarr_root=str(multisession_zarr_root),
+            cohorts=["openneuro"],
+            modalities=["T1w", "T2w", "PDw", "dwi"],
+            image_size=32,
+            batch_size=2,
+            num_workers=0,
+            val_fraction=0.3,
+            seed=1337,
+        )
+        dm.setup()
+        return dm
+
+    assert _val_subjects(build()) == _val_subjects(build())
+
+
 def test_discover_groups_modalities_by_subject(fake_zarr_root: Path) -> None:
     dm = ZarrMultimodalDataModule(
         zarr_root=str(fake_zarr_root),
@@ -141,7 +226,7 @@ def test_corrupt_zarr_store_treated_as_absent(tmp_path: Path) -> None:
     good = tmp_path / "sub-001_T1w.zarr"
     r = zarr.open(str(good), mode="w")
     # non-constant volume so the z-score isn't degenerate (constant -> std 0 -> all 0)
-    ramp = (np.arange(40 * 40 * 40, dtype=np.float32).reshape(40, 40, 40) + 1.0)
+    ramp = np.arange(40 * 40 * 40, dtype=np.float32).reshape(40, 40, 40) + 1.0
     r.create_dataset("data", shape=ramp.shape, dtype=np.float32, overwrite=True)[...] = ramp
     bad = tmp_path / "sub-001_T2w.zarr"
     zarr.open(str(bad), mode="w")  # group with NO `data` array — the partial-store case
@@ -200,7 +285,9 @@ def test_perceptual_loss_carries_gradient() -> None:
     pytest.importorskip("torchvision")
     from neurodrift.train.lightning_module import _TriOrthoVGGPerceptual
 
-    perc = _TriOrthoVGGPerceptual()
+    # weights=None: this test only checks the gradient path, and the random VGG keeps
+    # CI offline (no 550 MB ImageNet download).
+    perc = _TriOrthoVGGPerceptual(weights=None)
     recon = torch.randn(1, 3, 16, 16, 16, requires_grad=True)
     target = torch.randn(1, 3, 16, 16, 16)
     loss = perc(recon, target)
@@ -208,6 +295,29 @@ def test_perceptual_loss_carries_gradient() -> None:
     assert recon.grad is not None and recon.grad.abs().sum().item() > 0.0, (
         "perceptual loss produced no gradient on recon"
     )
+
+
+def test_perceptual_defaults_to_pretrained_weights(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The perceptual loss must request PRETRAINED VGG weights by default.
+
+    Regression for the silent quality bug where vgg19(weights=None) shipped a
+    randomly-initialized 'perceptual' loss (~a random projection). Asserted via a
+    monkeypatched vgg19 so the test needs no network.
+    """
+    pytest.importorskip("torchvision")
+    import torchvision
+    from neurodrift.train.lightning_module import _TriOrthoVGGPerceptual
+
+    seen: dict[str, object] = {}
+    real_vgg19 = torchvision.models.vgg19
+
+    def spy_vgg19(*args, **kwargs):  # type: ignore[no-untyped-def]
+        seen["weights"] = kwargs.get("weights", "MISSING")
+        return real_vgg19(weights=None)  # never download in the test
+
+    monkeypatch.setattr(torchvision.models, "vgg19", spy_vgg19)
+    _TriOrthoVGGPerceptual()  # default weights
+    assert seen["weights"] == "DEFAULT", "perceptual VGG must default to pretrained weights"
 
 
 def test_target_drives_masked_l1_for_dropped_modality() -> None:
@@ -252,6 +362,28 @@ def test_zscore_sanitizes_overflow_and_nonfinite() -> None:
         # extreme finite voxels must be clipped, not just finite, so a single
         # outlier can't dominate the recon L1 and spike the per-batch loss
         assert np.abs(out).max() <= 10.0 + 1e-3, "z-scored output must be clipped to ±10 std"
+
+
+def test_zscore_rezeros_background() -> None:
+    """Background (outside the brain) must stay exactly 0 after z-scoring.
+
+    Regression for a nonzero background plane: applying (x-mu)/sd to every voxel
+    maps background 0 -> -mu/sd, so a present slot's background disagreed with a
+    dropped/absent slot's 0 and widened the per-volume PSNR data_range. _zscore now
+    masks to the brain (x>0) and re-zeros background.
+    """
+    from neurodrift.train.data_module import _zscore
+
+    vol = np.zeros((40, 40, 40), dtype=np.float32)
+    brain = (np.abs(np.random.RandomState(1).randn(20, 20, 20)).astype(np.float32)) + 1.0
+    vol[10:30, 10:30, 10:30] = brain
+    out = _zscore(vol)
+    bg = out.copy()
+    bg[10:30, 10:30, 10:30] = 0.0
+    assert np.all(bg == 0.0), "background must remain exactly zero after z-score"
+    assert np.abs(out[10:30, 10:30, 10:30]).sum() > 0.0, (
+        "brain region must be normalized, not zeroed"
+    )
 
 
 def test_batch_shape_and_mask(fake_zarr_root: Path) -> None:
