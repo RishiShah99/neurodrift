@@ -343,6 +343,21 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         n_val = max(1, int(len(groups) * self.val_fraction))
         val_groups = groups[:n_val]
         train_groups = groups[n_val:]
+        # Bake multimodal oversampling into the dataset by DUPLICATING multimodal
+        # subject groups, instead of a WeightedRandomSampler. A custom sampler is
+        # not safe under DDP — Lightning can't split it into even per-rank shards,
+        # so ranks end an epoch with different batch counts and deadlock at the
+        # epoch-boundary all-reduce (observed: scattered GPU util, step frozen).
+        # Duplicating groups keeps a plain map-style dataset, so Lightning's standard
+        # DistributedSampler shards it evenly. Train re-randomizes the crop per access,
+        # so duplicates are augmentations, not identical copies.
+        factor = max(1, int(round(self.multimodal_oversample)))
+        if factor > 1:
+            expanded: list[SubjectGroup] = []
+            for g in train_groups:
+                expanded.extend([g] * (factor if self._multimodal_count(g) >= 2 else 1))
+            rng.shuffle(expanded)
+            train_groups = expanded
         self.train_ds = ZarrMultimodalDataset(
             train_groups,
             self.modalities,
@@ -365,18 +380,6 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
     def _multimodal_count(self, group: SubjectGroup) -> int:
         return sum(1 for mod in self.modalities if mod in group.scans_by_modality)
 
-    def _train_sampler(self) -> "torch.utils.data.Sampler[int] | None":
-        """WeightedRandomSampler oversampling multimodal subjects, or None."""
-        if self.multimodal_oversample == 1.0 or self.train_ds is None:
-            return None
-        from torch.utils.data import WeightedRandomSampler
-
-        weights = [
-            self.multimodal_oversample if self._multimodal_count(g) >= 2 else 1.0
-            for g in self.train_ds.groups
-        ]
-        return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
     def _loader_kwargs(self) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "batch_size": self.batch_size,
@@ -385,20 +388,21 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
             "pin_memory": True,
             "persistent_workers": self.num_workers > 0,
         }
-        # gcsfs opens a gs:// store via an asyncio loop + background thread that
-        # do not survive a fork; forked workers crash on the first zarr.open.
-        # Spawned workers start clean and build their own loop per process.
-        if self.num_workers > 0:
+        # gcsfs opens a gs:// store via an asyncio loop + background thread that do
+        # not survive a fork, so a gs:// root needs spawned workers. But the canonical
+        # training path reads the LOCAL zarr cache (plain files), where fork is correct
+        # AND lighter: spawn here means 8 ranks x num_workers fresh interpreters
+        # (~192 procs) that re-import torch and can wedge at epoch boundaries. Only
+        # force spawn when the root is actually remote.
+        if self.num_workers > 0 and str(self.zarr_root).startswith("gs://"):
             kwargs["multiprocessing_context"] = "spawn"
         return kwargs
 
     def train_dataloader(self) -> DataLoader[dict[str, Any]]:
         assert self.train_ds is not None
-        sampler = self._train_sampler()
-        # A sampler and shuffle are mutually exclusive; the weighted sampler
-        # already randomizes order.
-        shuffle = sampler is None
-        return DataLoader(self.train_ds, shuffle=shuffle, sampler=sampler, **self._loader_kwargs())
+        # Plain shuffle: under DDP, Lightning wraps this in a DistributedSampler that
+        # shards evenly across ranks (oversampling is already baked into the dataset).
+        return DataLoader(self.train_ds, shuffle=True, **self._loader_kwargs())
 
     def val_dataloader(self) -> DataLoader[dict[str, Any]]:
         assert self.val_ds is not None
