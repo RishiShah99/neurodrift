@@ -20,10 +20,13 @@ litmodule:
 # 23,513 train groups -> ~1,470 steps/epoch at batch 2 x 8 GPUs. ~20 of these fat epochs
 # already exceeds the multimodal (cross-modal) gradient updates of the old converged
 # 95-epoch run, and fits the originally-budgeted ~20h. (max_epochs=100 here is ~95h /
-# ~$4k on spot — do NOT.) T_max matches the 20-epoch step count so the cosine LR anneals
-# to eta_min exactly at the end. Rescale BOTH together if the corpus or oversample changes.
+# ~$4k on spot — do NOT.)
+#
+# max_epochs is the SINGLE knob. The LitModule pins the cosine scheduler's T_max to the
+# actual planned step count (estimated_stepping_batches = epochs x steps/epoch) at
+# runtime, so the LR anneals to eta_min exactly at the end with no hand-computed T_max
+# to keep in sync. The scheduler.T_max in vae_v0_disentangled is only a placeholder the
+# runtime overrides (see DisentangledVAELitModule._build_scheduler) — setting it here
+# would do NOTHING, so don't. If the corpus/oversample/devices change, just set epochs.
 trainer:
   max_epochs: 20
-
-scheduler:
-  T_max: 29400
