@@ -1,0 +1,13 @@
+# v0 latent corpus: the Phase-2 flow / SAE models train on the FROZEN VAE's
+# cached content latents (one (16,32,32,32) code per subject-session), not on
+# voxels — see scripts/encode_latents.py, which precomputes these and stamps age
+# from each cohort's participants.tsv. latent_root mirrors the v0 voxel layout
+# (gs://neurodrift-data/<prefix>/<cohort>/<stem>.zarr); cohorts match v0_walkup.
+_target_: neurodrift.data.latents.LatentDataModule
+
+latent_root: ${oc.env:NEURODRIFT_LATENT_ROOT,gs://neurodrift-data/latents}
+cohorts: [abide, openneuro]
+batch_size: 8
+num_workers: 4
+val_fraction: 0.05
+seed: 1337
