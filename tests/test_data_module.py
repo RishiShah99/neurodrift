@@ -126,6 +126,41 @@ def test_val_split_is_deterministic_across_instances(
     assert _val_subjects(build()) == _val_subjects(build())
 
 
+def test_val_split_stratifies_multimodality(tmp_path: Path) -> None:
+    """Val must hold multimodal subjects even when they are a small minority.
+
+    Regression: a subject-level split blind to multimodality can land zero (or a
+    high-variance handful of) >=2-modality subjects in val at a small val_fraction,
+    making the headline cross-modal dB noisy or NaN (_mean([])). The split now
+    stratifies on multimodality with a floor (capped at half the pool).
+    """
+    cohort = tmp_path / "openneuro"
+    cohort.mkdir()
+    for i in range(40):  # T1-only majority
+        _write_zarr(cohort / f"sub-u{i:03d}_T1w.zarr", (32, 32, 32), {})
+    for i in range(6):  # multimodal minority (T1w + T2w)
+        for mod in ("T1w", "T2w"):
+            _write_zarr(cohort / f"sub-m{i:03d}_{mod}.zarr", (32, 32, 32), {})
+    dm = ZarrMultimodalDataModule(
+        zarr_root=str(tmp_path),
+        cohorts=["openneuro"],
+        modalities=["T1w", "T2w", "PDw", "dwi"],
+        image_size=32,
+        batch_size=2,
+        num_workers=0,
+        val_fraction=0.05,  # 5% of 46 ≈ 2; a blind split could miss all 6 multimodal
+        min_multimodal_val=2,
+        modality_dropout_p=0.0,
+    )
+    dm.setup()
+    assert dm.train_ds is not None and dm.val_ds is not None
+    val_mm = {(g.cohort, g.subject) for g in dm.val_ds.groups if dm._multimodal_count(g) >= 2}
+    train_mm = {(g.cohort, g.subject) for g in dm.train_ds.groups if dm._multimodal_count(g) >= 2}
+    assert len(val_mm) >= 2, "val must hold >= min_multimodal_val multimodal subjects"
+    assert _val_subjects(dm).isdisjoint(_train_subjects(dm)), "subject leaked across split"
+    assert len(train_mm) >= len(val_mm), "the floor must not starve train of multimodal subjects"
+
+
 def test_discover_groups_modalities_by_subject(fake_zarr_root: Path) -> None:
     dm = ZarrMultimodalDataModule(
         zarr_root=str(fake_zarr_root),
@@ -318,6 +353,35 @@ def test_perceptual_defaults_to_pretrained_weights(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(torchvision.models, "vgg19", spy_vgg19)
     _TriOrthoVGGPerceptual()  # default weights
     assert seen["weights"] == "DEFAULT", "perceptual VGG must default to pretrained weights"
+
+
+def test_perceptual_hard_raises_on_failed_pretrained_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed PRETRAINED load must hard-raise, never silently fall back to random.
+
+    Regression for the high-cost silent bug: on a multi-GPU cook a torch-hub race can
+    make vgg19(weights='DEFAULT') fail on a rank. The old code warned and fell back to
+    random features, which DDP then broadcast to every rank — a meaningless 'perceptual'
+    term that corrupts the headline number while eval still 'runs'. Requesting pretrained
+    weights must refuse to start instead. `weights=None` stays the opt-in to random.
+    """
+    pytest.importorskip("torchvision")
+    import torchvision
+    from neurodrift.train.lightning_module import _TriOrthoVGGPerceptual
+
+    real_vgg19 = torchvision.models.vgg19
+
+    def boom_vgg19(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("weights") is not None:
+            raise RuntimeError("simulated torch-hub download failure")
+        return real_vgg19(weights=None)
+
+    monkeypatch.setattr(torchvision.models, "vgg19", boom_vgg19)
+    with pytest.raises(RuntimeError, match="Refusing to fall back"):
+        _TriOrthoVGGPerceptual(weights="DEFAULT")
+    # weights=None is the explicit opt-in to random (offline/tests) and must still work.
+    _TriOrthoVGGPerceptual(weights=None)
 
 
 def test_target_drives_masked_l1_for_dropped_modality() -> None:

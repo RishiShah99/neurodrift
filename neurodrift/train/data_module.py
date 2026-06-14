@@ -24,6 +24,7 @@ stems line up with the right channel.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 import re
@@ -37,6 +38,8 @@ import numpy as np
 import torch
 import zarr
 from torch.utils.data import DataLoader, Dataset
+
+log = logging.getLogger(__name__)
 
 _STEM_RE = re.compile(
     r"^(?P<subject>sub-[^_]+)(?:_(?P<session>ses-[^_]+))?_(?P<modality>[A-Za-z0-9]+)$"
@@ -308,6 +311,7 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         batch_size: int = 2,
         num_workers: int = 4,
         val_fraction: float = 0.05,
+        min_multimodal_val: int = 8,
         modality_dropout_p: float = 0.3,
         synth_dropout_p: float = 0.0,
         multimodal_oversample: float = 1.0,
@@ -322,6 +326,10 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.val_fraction = val_fraction
+        # Floor on subjects-with->=2-modalities held in val. Cross-modal synthesis is
+        # only measurable on multimodal subjects (a corpus minority), so a blind
+        # val_fraction split can starve val of them; this guarantees a usable count.
+        self.min_multimodal_val = min_multimodal_val
         self.modality_dropout_p = modality_dropout_p
         self.synth_dropout_p = synth_dropout_p
         # Sampling weight for subjects with >=2 acquired modalities. Cross-modal
@@ -360,14 +368,38 @@ class ZarrMultimodalDataModule(L.LightningDataModule):
         # >=2 sessions (OpenNeuro has repeat scans) must land ENTIRELY in train or
         # val. Splitting per session puts the same anatomy/scanner on both sides and
         # inflates val recon and — worst — the headline cross-modal synthesis dB.
-        # Subjects are sorted (deterministic; `groups` is already canonically ordered)
-        # then shuffled with the seeded rng, so the split is reproducible and leak-free.
-        subjects = sorted({(g.cohort, g.subject) for g in groups})
-        rng.shuffle(subjects)
-        n_val = max(1, int(len(subjects) * self.val_fraction))
-        val_subjects = set(subjects[:n_val])
+        #
+        # STRATIFY on multimodality. Cross-modal synthesis is only measurable on
+        # subjects with >=2 acquired modalities in one session, and those are a corpus
+        # minority — a blind val_fraction split can land too few (high-variance
+        # cross-modal dB) or zero (NaN via _mean([])) in val. Split EACH stratum by
+        # val_fraction so val's multimodal coverage tracks the corpus, with a floor of
+        # min_multimodal_val (capped at half the pool so it can never starve train).
+        # Each stratum is sorted (deterministic; `groups` is already canonically
+        # ordered) then shuffled with the seeded rng → reproducible and leak-free.
+        all_subjects = {(g.cohort, g.subject) for g in groups}
+        multimodal_subjects = {
+            (g.cohort, g.subject) for g in groups if self._multimodal_count(g) >= 2
+        }
+        mm = sorted(s for s in all_subjects if s in multimodal_subjects)
+        uni = sorted(s for s in all_subjects if s not in multimodal_subjects)
+        rng.shuffle(mm)
+        rng.shuffle(uni)
+        floor_mm = min(self.min_multimodal_val, len(mm) // 2) if len(mm) > 1 else len(mm)
+        n_val_mm = min(len(mm), max(int(len(mm) * self.val_fraction), floor_mm))
+        n_val_uni = max(1, int(len(uni) * self.val_fraction)) if uni else 0
+        val_subjects = set(mm[:n_val_mm]) | set(uni[:n_val_uni])
+        if not val_subjects and all_subjects:  # degenerate tiny corpus: force one
+            val_subjects = {sorted(all_subjects)[0]}
         val_groups = [g for g in groups if (g.cohort, g.subject) in val_subjects]
         train_groups = [g for g in groups if (g.cohort, g.subject) not in val_subjects]
+        log.info(
+            "val split: %d subjects (%d multimodal of %d corpus-wide), %d train groups",
+            len(val_subjects),
+            len(val_subjects & multimodal_subjects),
+            len(multimodal_subjects),
+            len(train_groups),
+        )
         # Bake multimodal oversampling into the dataset by DUPLICATING multimodal
         # subject groups, instead of a WeightedRandomSampler. A custom sampler is
         # not safe under DDP — Lightning can't split it into even per-rank shards,
