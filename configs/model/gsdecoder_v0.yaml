@@ -1,0 +1,21 @@
+# Phase 4 — hierarchical feed-forward 3D Gaussian-splat decoder (z -> Gaussians ->
+# rendered orthogonal slices). NOT per-scene optimisation: a fixed bank of learned
+# query tokens cross-attends to the frozen latent and regresses per-Gaussian params
+# (C4G-style compact query tokens, arXiv:2605.31595; 3DGS, Kerbl 2023).
+#
+# num_coarse 50k + num_fine 200k is the REAL target capacity. Rendering on the box
+# uses the CUDA `gsplat` rasteriser (CUDA-only; the [splat] extra). CPU runs and the
+# unit tests use the pure-torch reference rasteriser and shrink these counts hard.
+_target_: neurodrift.models.gsdecoder.GSDecoder3D
+
+latent_channels: 16
+model_dim: 256
+num_coarse: 50000
+num_fine: 200000
+num_heads: 8
+depth: 4
+image_size: 128
+intensity_channels: 1
+# Continuous gate threshold: parcellation-mask cells above this count as "active"
+# when deriving how much of the fine tier stays live.
+mask_threshold: 0.5
