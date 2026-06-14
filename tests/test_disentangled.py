@@ -186,6 +186,39 @@ def test_nonfinite_grad_skip_zeros_grads() -> None:
     assert p.grad is None or float(p.grad.abs().sum()) == 0.0, "grads must be cleared on skip"
 
 
+def test_nonfinite_skip_is_true_noop_with_stateful_adamw() -> None:
+    """A skipped step must leave params byte-identical even with live AdamW momentum.
+
+    The SGD(momentum=0) case above is too weak — zeroed grads no-op there trivially.
+    The load-bearing property is that zero_grad(set_to_none=True) makes AdamW SKIP the
+    param (grad is None), so accumulated momentum does NOT drift it on a skipped step.
+    Also asserts a large-but-finite grad is NOT mistaken for non-finite (regression for
+    the pow(2).sum() overflow). Uses AdamW with pre-seeded state to exercise both.
+    """
+    from neurodrift.train.lightning_module import _skip_step_if_nonfinite
+
+    lit = _make_lit(use_adversarial=False, use_perceptual=False)
+    opt = torch.optim.AdamW(lit.parameters(), lr=0.1)
+    p = next(param for param in lit.parameters() if param.requires_grad)
+
+    # build up optimizer state (exp_avg / exp_avg_sq) with one finite step
+    p.grad = torch.ones_like(p)
+    assert _skip_step_if_nonfinite(lit, opt) is False
+    opt.step()
+    assert opt.state[p], "AdamW must hold momentum state for p after a real step"
+
+    # a large-but-finite grad must NOT be treated as non-finite (pow(2).sum would overflow)
+    p.grad = torch.full_like(p, 1e20)
+    assert _skip_step_if_nonfinite(lit, opt) is False, "large finite grads must not be skipped"
+
+    # a non-finite grad must make the NEXT step a TRUE no-op despite live momentum
+    snapshot = p.detach().clone()
+    p.grad = torch.full_like(p, float("inf"))
+    assert _skip_step_if_nonfinite(lit, opt) is True
+    opt.step()  # grad is None -> AdamW skips p -> momentum must not drift it
+    assert torch.equal(p, snapshot), "a skipped step must leave params byte-identical"
+
+
 def test_adversarial_ramp_schedule() -> None:
     lit = _make_lit(use_adversarial=True, use_perceptual=False)
     lit._step_count.fill_(0)

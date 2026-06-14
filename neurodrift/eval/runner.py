@@ -42,6 +42,9 @@ def evaluate(
     `encode/decode` (the v0 `VAE3D` contract). `batches` yields the DataModule's
     collated dicts (`image`, `target`, `present_mask`, `cohort`).
     """
+    # eval() => both VAE3D.reparameterize and DisentangledVAE3D.reparameterize return
+    # mu (no eps*std sampling), so every PSNR/SSIM below is deterministic and the
+    # cross-modal numbers reproduce run-to-run. (Verified: not stochastic at eval.)
     model = model.to(device).eval()
     mods = list(modalities)
     m = len(mods)

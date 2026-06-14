@@ -45,17 +45,23 @@ def _skip_step_if_nonfinite(module: L.LightningModule, optimizer: Any) -> bool:
     already completed in lockstep, so every rank sees the same (post-reduce) grads
     and makes the same skip decision — no NCCL desync (unlike returning None from
     training_step, which would skip backward on only one rank and hang the others).
-    One host sync (the finiteness check), not the per-step loss.item() it replaces.
-    Returns True when the step was skipped.
+    `zero_grad(set_to_none=True)` makes the subsequent step a TRUE no-op: AdamW (and
+    the other torch optimizers) skip any param whose grad is None, so no momentum-
+    driven update leaks through on a skipped step.
+
+    Test finiteness with `isfinite` directly — NOT `pow(2).sum()`, which squares a
+    large-but-finite grad (|g| >= ~1.8e19) past the float32 max to inf and would
+    wrongly reject it. Still one host sync (stack the per-tensor bool flags, one
+    `.all()`), not the per-step loss.item() it replaces. Returns True when skipped.
     """
-    sq = [
-        p.grad.detach().pow(2).sum()
+    flags = [
+        torch.isfinite(p.grad).all()
         for p in module.parameters()
         if p.requires_grad and p.grad is not None
     ]
-    if not sq:
+    if not flags:
         return False
-    if bool(torch.isfinite(torch.stack(sq).sum())):
+    if bool(torch.stack(flags).all()):
         return False
     optimizer.zero_grad(set_to_none=True)
     return True
@@ -71,8 +77,10 @@ class _TriOrthoVGGPerceptual(nn.Module):
     `weights` is passed straight to `torchvision.models.vgg19`. It MUST be the
     pretrained tag ("DEFAULT"/"IMAGENET1K_V1") for this to be a real perceptual
     signal: an untrained VGG (`weights=None`) is ~a random projection, so the term
-    silently degrades to noise — a high-impact bug for a model whose whole job is to
-    beat a blur ceiling. `None` is retained only for tests (no 550 MB download).
+    degrades to noise — a high-impact bug for a model whose whole job is to beat a
+    blur ceiling. A FAILED pretrained load therefore hard-raises rather than falling
+    back to random; `weights=None` is the explicit opt-in to random, retained only
+    for tests / offline smoke (no 550 MB download).
     """
 
     def __init__(self, weights: str | None = "DEFAULT") -> None:
@@ -84,19 +92,18 @@ class _TriOrthoVGGPerceptual(nn.Module):
         try:
             vgg = models.vgg19(weights=weights)
         except Exception as err:  # offline box: download of the pretrained tag failed
-            if weights is None:
-                raise
-            import warnings
-
-            warnings.warn(
-                f"vgg19(weights={weights!r}) failed to load ({err}); falling back to "
-                "RANDOM features. The perceptual loss is now ~meaningless — pre-download "
-                'the weights (python -c "import torchvision; '
-                "torchvision.models.vgg19(weights='DEFAULT')\") or set use_perceptual=false.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            vgg = models.vgg19(weights=None)
+            # `weights=None` never downloads, so reaching here means a PRETRAINED tag
+            # could not be fetched. Falling back to random features would silently turn
+            # the perceptual term into noise — and under DDP that noise is broadcast to
+            # every rank, gated only by a buried warning, while eval still "runs". That
+            # is the exact high-cost bug this loss exists to avoid, so HARD-RAISE: a
+            # loud failure at startup is far cheaper than a wasted multi-GPU cook.
+            raise RuntimeError(
+                f"vgg19(weights={weights!r}) failed to load ({err}). Refusing to fall back "
+                "to RANDOM features (the perceptual loss would be meaningless). Pre-download "
+                'the weights — python -c "import torchvision; '
+                "torchvision.models.vgg19(weights='DEFAULT')\" — or set use_perceptual=false."
+            ) from err
         self.features = vgg.features[:16]
         for p in self.features.parameters():
             p.requires_grad = False
@@ -278,10 +285,12 @@ class VAELitModule(L.LightningModule):
         if self.scheduler_partial is None:
             return optimizer
         scheduler = self.scheduler_partial(optimizer)
-        # The configured T_max is a guess; the true step count depends on corpus
-        # size, devices, batch size and accumulation — all of which have churned
-        # on this project. Pin the cosine half-period to the actual planned step
-        # count so the LR genuinely anneals to eta_min instead of stalling halfway.
+        # SINGLE SOURCE OF TRUTH for the cosine half-period. The configured
+        # scheduler.T_max is only a placeholder (CosineAnnealingLR needs one to
+        # instantiate); the true step count depends on corpus size, devices, batch
+        # size and accumulation — all of which churn on this project — so we
+        # unconditionally pin T_max to the actual planned step count here. Editing the
+        # YAML T_max does NOT change training; change max_epochs (and the data) instead.
         total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
         if total_steps and hasattr(scheduler, "T_max"):
             scheduler.T_max = int(total_steps)
@@ -489,7 +498,12 @@ class DisentangledVAELitModule(L.LightningModule):
                     cyc_l = cyc_l + _masked_mean(cyc, pjk)
                 if adv_w > 0 and self.discriminator is not None:
                     g_adv = g_adv + self._hinge_g(self.discriminator(fake_k, k), pjk)
-                fakes.append((fake_k.detach(), tgt_k, k, pjk))
+                # Only the manual-opt GAN path consumes `fakes` (for the D step). On the
+                # automatic-opt no-GAN flagship it is discarded, so appending here would
+                # just pin m*(m-1) detached fake volumes alive for nothing on the
+                # memory-bound B200 cook — skip building it there.
+                if not self.automatic_optimization:
+                    fakes.append((fake_k.detach(), tgt_k, k, pjk))
 
         # content-invariance: per-modality content means must agree for a subject.
         # L2 in latent space, one branch detached (lower-variance pull to consensus).
@@ -560,7 +574,8 @@ class DisentangledVAELitModule(L.LightningModule):
         self.manual_backward(g_total)
         # Manual opt: Lightning does NOT call on_before_optimizer_step, so guard the
         # step inline. Skip (grads already zeroed) if non-finite so a NaN can't poison
-        # the generator. Check before clipping, which would mangle an inf norm to 0.
+        # the generator. Must check BEFORE clipping: clip-by-norm on a non-finite grad
+        # yields NaN (inf * 1/inf), not a safe value, so clipping can't sanitize it.
         if not _skip_step_if_nonfinite(self, opt_g):
             self.clip_gradients(opt_g, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
             opt_g.step()
@@ -642,6 +657,10 @@ class DisentangledVAELitModule(L.LightningModule):
         if self.scheduler_partial is None:
             return None
         scheduler = self.scheduler_partial(opt_g)
+        # SINGLE SOURCE OF TRUTH for the cosine half-period (see VAELitModule): the
+        # configured scheduler.T_max is a placeholder, unconditionally overridden with
+        # the real planned step count so the LR anneals to eta_min at the end. Editing
+        # the YAML T_max does nothing; change max_epochs instead.
         total_steps = getattr(self.trainer, "estimated_stepping_batches", None)
         if total_steps and hasattr(scheduler, "T_max"):
             scheduler.T_max = int(total_steps)
