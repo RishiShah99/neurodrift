@@ -48,11 +48,14 @@ def check(experiment: str) -> None:
 
     # configure_optimizers needs a trainer ref for estimated_stepping_batches; guard it.
     n_params = sum(p.numel() for p in model.parameters())
+    # Not every model is modality-stacked: the VAE configs carry `modalities`, but the
+    # flow / 3DGS-decoder / SAE operate on the fused latent and have no such field.
+    modalities = cfg.model.get("modalities")
     print(f"[{experiment}]")
     print(f"  model         = {type(model).__name__}  ({n_params / 1e6:.1f}M params)")
     print(f"  litmodule     = {type(lit).__name__}")
     print(f"  data          = {type(data).__name__}  cohorts={list(cfg.data.cohorts)}")
-    print(f"  modalities    = {list(cfg.model.modalities)}")
+    print(f"  modalities    = {list(modalities) if modalities is not None else '— (latent-space model)'}")
     print(
         f"  trainer       = devices={cfg.trainer.devices} strategy={cfg.trainer.get('strategy')} "
         f"precision={cfg.trainer.precision} grad_clip={cfg.trainer.get('gradient_clip_val', 'unset')}"
@@ -78,6 +81,14 @@ def check(experiment: str) -> None:
 
 
 if __name__ == "__main__":
-    for exp in sys.argv[1:] or ["vae_v0_disentangled", "vae_v0_disentangled_noadv", "vae_v0"]:
+    default_experiments = [
+        "vae_v0_disentangled",
+        "vae_v0_disentangled_noadv",
+        "vae_v0",
+        "flow_v0",
+        "gsdecoder_v0",
+        "sae_v0",
+    ]
+    for exp in sys.argv[1:] or default_experiments:
         check(exp)
     print("OK: all configs compose + instantiate")
