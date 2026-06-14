@@ -1,0 +1,34 @@
+# @package _global_
+# Phase 5 — TopK-SAE on the frozen VAE content latent for interpretability.
+# Trains on the cached latent store (Agent D's LatentDataModule), not voxels: a
+# latent is ~2000x smaller than the trimodal input, so the SAE cooks fast. Reuses
+# the rock-solid automatic-optimization + plain-DDP path (no GAN, no manual opt).
+#
+# Depends on configs/data/latents_v0.yaml (the LatentDataModule config) existing —
+# owned by the latent-store agent. Referenced by name only here.
+defaults:
+  - /data: latents_v0
+  - /model: sae_v0
+  - /trainer: eight_b200_auto
+  - _self_
+
+experiment_name: sae_v0
+
+litmodule:
+  _target_: neurodrift.train.sae_module.SAELitModule
+  # Extra LitModule-level weight on the model's already-scaled AuxK loss. 1.0 keeps
+  # the model's aux_coef the single knob; raise it only if dead_frac stays high.
+  aux_coef: 1.0
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingLR
+  # Placeholder T_max — SAELitModule pins it to the real planned step count at
+  # runtime (estimated_stepping_batches). Editing this does nothing; set max_epochs.
+  T_max: 100000
+  eta_min: 1.0e-6

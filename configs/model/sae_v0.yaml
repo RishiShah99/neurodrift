@@ -1,0 +1,17 @@
+# TopK sparse autoencoder over the frozen VAE content latent — Phase 5.
+# Per-spatial-token dictionary (one C-vector per latent voxel): d_in == the VAE's
+# latent_channels (16). The OpenAI recipe (Gao et al. 2024) — exact-k sparsity +
+# AuxK dead-latent revival + unit-norm decoder. d_hidden is the overcomplete
+# dictionary size; k is the (fixed) L0; aux_k is how many dead latents the AuxK
+# term revives per step. Same external contract tests use with tiny dims.
+_target_: neurodrift.models.sae.TopKSAE
+
+d_in: 16
+d_hidden: 8192
+k: 32
+aux_k: 256
+# AuxK coefficient inside the model (OpenAI default ~1/k). The LitModule adds its
+# own aux_coef on top (default 1.0), so the effective weight is the product.
+aux_coef: 0.03125
+# Steps a latent may go unfired before it counts as dead (and becomes AuxK-eligible).
+dead_steps_threshold: 1000
