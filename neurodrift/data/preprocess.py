@@ -49,10 +49,20 @@ class Step(ABC):
     name: ClassVar[str] = "step"
 
     def run(self, scan: Scan, work_dir: Path) -> Path:
-        """Run the step, skipping if its output sentinel already exists."""
+        """Run the step, skipping only if a VALID (non-empty) output already exists.
+
+        Checking existence alone is unsafe: a write cut short by spot preemption, an
+        ENOSPC disk-full, or a SIGKILL leaves a 0-byte ``.nii.gz`` behind. A bare
+        ``exists()`` treats that as done and feeds the empty file to the next step,
+        where nibabel raises ``ImageFileError: Empty file`` — silently dropping the
+        scan from the corpus. Treat an empty output as absent: discard and recompute,
+        so resume self-heals instead of propagating a poisoned intermediate.
+        """
         out = self.output_path(scan, work_dir)
-        if out.exists():
+        if out.exists() and out.stat().st_size > 0:
             return out
+        if out.exists():  # empty/partial from an interrupted write — redo it
+            out.unlink()
         out.parent.mkdir(parents=True, exist_ok=True)
         return self._do(scan, work_dir, out)
 
