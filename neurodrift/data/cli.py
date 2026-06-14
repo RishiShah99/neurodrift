@@ -56,6 +56,59 @@ def ants_register_to_mni(
     return output_nifti
 
 
+def ants_coregister_via_t1(
+    input_nifti: Path,
+    output_nifti: Path,
+    t1_nifti: Path,
+    template_nifti: Path,
+    *,
+    transform: str = "Rigid",
+) -> Path:
+    """Register `input_nifti` to MNI THROUGH the subject's own T1, resampling ONCE (E7).
+
+    Registering each modality to MNI independently leaves small residual T1<->T2
+    misalignment per subject — an irreducible cross-modal synthesis floor that
+    masquerades as a model cap. Instead: rigid-register `input` to the subject's T1
+    (intra-subject), then COMPOSE that with the T1->MNI transform and resample the
+    input a SINGLE time through the concatenated transform (composing avoids a double
+    interpolation that would re-blur). Result: `input` lands on the MNI template grid
+    AND is voxel-aligned to the subject's T1.
+
+    Falls back to the antspyx-bundled MNI template if `template_nifti` is absent.
+    """
+    import ants
+
+    template_path = Path(template_nifti)
+    if not template_path.exists():
+        template_path = Path(ants.get_ants_data("mni"))
+
+    template = ants.image_read(str(template_path))
+    t1 = ants.image_read(str(t1_nifti))
+    moving = ants.image_read(str(input_nifti))
+
+    # T1 -> MNI (lands T1 on the template grid) and input -> T1 (intra-subject), rigid.
+    reg_t1 = ants.registration(fixed=template, moving=t1, type_of_transform=transform)
+    reg_mod = ants.registration(fixed=t1, moving=moving, type_of_transform=transform)
+
+    # Resample `input` onto the template grid through input->T1->MNI in ONE pass.
+    # apply_transforms composes the list LAST-element-first (the antspyx fwdtransforms
+    # convention: an [warp, affine] list applies the affine first), so the transform
+    # nearest the moving image (input->T1) must come FIRST and the T1->MNI transform
+    # LAST. Concretely: a template-grid point is mapped template->T1 (reg_t1, applied
+    # first) then T1->input (reg_mod, applied last) to pull the input intensity.
+    warped = ants.apply_transforms(
+        fixed=template,
+        moving=moving,
+        transformlist=[*reg_mod["fwdtransforms"], *reg_t1["fwdtransforms"]],
+    )
+    if warped is None:
+        raise CLIError(f"antspyx co-registration produced no output for {input_nifti}")
+
+    output_nifti.parent.mkdir(parents=True, exist_ok=True)
+    ants.image_write(warped, str(output_nifti))
+    return output_nifti
+
+
 # Map our BIDS modality labels to antspynet brain-extraction model names.
 # Using the T1 model on a T2/FLAIR volume yields a wrong brain mask (the
 # contrast it was trained on is inverted), which silently degrades exactly the

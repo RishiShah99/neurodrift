@@ -174,3 +174,101 @@ def test_skullstrip_uses_scan_modality(tmp_path: Path, monkeypatch: pytest.Monke
 
 def _all_intermediates(work_dir: Path) -> list[Path]:
     return sorted(p for p in work_dir.rglob("*") if p.is_file())
+
+
+# ----- E7 intra-subject co-registration -----------------------------------------
+
+
+def _make_scan(tmp_path: Path, subject: str, modality: str, session: str | None = None) -> Any:
+    from neurodrift.data.bids import Scan
+
+    p = tmp_path / f"{subject}_{modality}.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), np.eye(4)), str(p))
+    return Scan(subject=subject, session=session, modality=modality, path=p)  # type: ignore[arg-type]
+
+
+def test_coregister_routes_siblings_through_t1(tmp_path: Path) -> None:
+    """T1 registers straight to MNI; every sibling co-registers THROUGH the subject T1."""
+    from neurodrift.data.preprocess import coregister_subject_group
+
+    work = tmp_path / "work"
+    scans = [
+        _make_scan(tmp_path, "sub-001", "T1w"),
+        _make_scan(tmp_path, "sub-001", "T2w"),
+        _make_scan(tmp_path, "sub-001", "FLAIR"),
+    ]
+    reg_calls: list[Path] = []
+    coreg_calls: list[tuple[Path, Path]] = []  # (input, t1 reference)
+
+    def reg_stub(inp: Path, out: Path, **kw: Any) -> Path:
+        reg_calls.append(Path(inp))
+        return ext_cli.passthrough_copy(inp, out)
+
+    def coreg_stub(inp: Path, out: Path, **kw: Any) -> Path:
+        coreg_calls.append((Path(inp), Path(kw["t1_nifti"])))
+        return ext_cli.passthrough_copy(inp, out)
+
+    outputs = coregister_subject_group(
+        scans,
+        work,
+        template=tmp_path / "tmpl.nii.gz",
+        register_fn=reg_stub,
+        coregister_fn=coreg_stub,
+    )
+    t1_path = scans[0].path
+    assert reg_calls == [t1_path], "only the T1 goes straight to MNI"
+    assert {c[0] for c in coreg_calls} == {scans[1].path, scans[2].path}
+    assert all(ref == t1_path for _, ref in coreg_calls), "siblings must anchor to the subject T1"
+    assert set(outputs) == {"T1w", "T2w", "FLAIR"}
+    assert all(p.exists() for p in outputs.values())
+
+
+def test_coregister_falls_back_to_mni_without_t1(tmp_path: Path) -> None:
+    """A session with no T1 cannot anchor — every modality goes straight to MNI, none dropped."""
+    from neurodrift.data.preprocess import coregister_subject_group
+
+    work = tmp_path / "work"
+    scans = [_make_scan(tmp_path, "sub-002", "T2w"), _make_scan(tmp_path, "sub-002", "FLAIR")]
+    reg_calls: list[Path] = []
+    coreg_calls: list[Path] = []
+
+    def reg_stub(inp: Path, out: Path, **kw: Any) -> Path:
+        reg_calls.append(Path(inp))
+        return ext_cli.passthrough_copy(inp, out)
+
+    def coreg_stub(inp: Path, out: Path, **kw: Any) -> Path:
+        coreg_calls.append(Path(inp))
+        return ext_cli.passthrough_copy(inp, out)
+
+    coregister_subject_group(
+        scans, work, template=tmp_path / "t.nii.gz", register_fn=reg_stub, coregister_fn=coreg_stub
+    )
+    assert set(reg_calls) == {scans[0].path, scans[1].path}, "no T1 -> all straight to MNI"
+    assert coreg_calls == [], "no T1 -> nothing to co-register through"
+
+
+def test_coregister_is_idempotent(tmp_path: Path) -> None:
+    """A modality whose 01_register output already exists must be skipped."""
+    from neurodrift.data.preprocess import RegisterStep, coregister_subject_group
+
+    work = tmp_path / "work"
+    scans = [_make_scan(tmp_path, "sub-003", "T1w"), _make_scan(tmp_path, "sub-003", "T2w")]
+    t2_out = work / RegisterStep.name / f"{scans[1].stem}.nii.gz"
+    t2_out.parent.mkdir(parents=True, exist_ok=True)
+    nib.save(nib.Nifti1Image(np.zeros((8, 8, 8), dtype=np.float32), np.eye(4)), str(t2_out))
+
+    calls: list[tuple[str, Path]] = []
+
+    def reg_stub(inp: Path, out: Path, **kw: Any) -> Path:
+        calls.append(("reg", Path(inp)))
+        return ext_cli.passthrough_copy(inp, out)
+
+    def coreg_stub(inp: Path, out: Path, **kw: Any) -> Path:
+        calls.append(("coreg", Path(inp)))
+        return ext_cli.passthrough_copy(inp, out)
+
+    coregister_subject_group(
+        scans, work, template=tmp_path / "t.nii.gz", register_fn=reg_stub, coregister_fn=coreg_stub
+    )
+    assert ("reg", scans[0].path) in calls, "the T1 must still be registered"
+    assert ("coreg", scans[1].path) not in calls, "a pre-existing output must be skipped"

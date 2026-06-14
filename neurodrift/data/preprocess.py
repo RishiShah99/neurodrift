@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import shutil
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -79,6 +79,59 @@ class RegisterStep(Step):
     def _do(self, scan: Scan, work_dir: Path, out: Path) -> Path:
         fn = self.cli_fn or cli.ants_register_to_mni
         return fn(scan.path, out, template_nifti=self.template, transform=self.transform)
+
+
+# The anatomical reference every other modality of a subject-session is co-registered
+# THROUGH (E7). T1w has the best SNR/contrast for a stable rigid alignment.
+_REFERENCE_MODALITY = "T1w"
+
+
+def coregister_subject_group(
+    scans: Sequence[Scan],
+    work_dir: Path,
+    template: Path,
+    *,
+    transform: str = "Rigid",
+    register_fn: CLIFn | None = None,
+    coregister_fn: CLIFn | None = None,
+) -> dict[str, Path]:
+    """E7 intra-subject co-registration for ONE subject-session's modalities.
+
+    Populates the RegisterStep (``01_register``) outputs for the group: the subject's
+    T1 is registered straight to MNI, and every other modality is registered to that
+    T1 and composed with T1->MNI so it lands on the MNI grid AND voxel-aligned to the
+    T1 (a single resampling, via ``cli.ants_coregister_via_t1``). Writes into the SAME
+    ``work_dir/01_register/<stem>.nii.gz`` location ``RegisterStep`` uses, so the rest
+    of the pipeline (skull-strip -> N4 -> harmonize -> zarr) runs unchanged and
+    ``RegisterStep`` idempotently skips. Run this as a pre-pass per subject-session.
+
+    The fns are injectable (tests stub them); they default to the antspyx primitives at
+    call time so a monkey-patch of ``cli.*`` after import is honoured. Falls back to
+    independent MNI registration for every modality when the group has no T1 (a T1-only
+    cohort, or a session whose T1 is missing) — never silently drops a scan. Idempotent:
+    a modality whose ``01_register`` output already exists is skipped.
+    """
+    register = register_fn or cli.ants_register_to_mni
+    coregister = coregister_fn or cli.ants_coregister_via_t1
+    reg_dir = work_dir / RegisterStep.name
+    reg_dir.mkdir(parents=True, exist_ok=True)
+
+    t1 = next((s for s in scans if s.modality == _REFERENCE_MODALITY), None)
+    outputs: dict[str, Path] = {}
+    for scan in scans:
+        out = reg_dir / f"{scan.stem}.nii.gz"
+        if out.exists():  # idempotent: don't redo a completed registration
+            outputs[scan.modality] = out
+            continue
+        if t1 is None or scan.modality == _REFERENCE_MODALITY:
+            # the reference itself, or no same-session T1 to anchor to -> straight to MNI
+            register(scan.path, out, template_nifti=template, transform=transform)
+        else:
+            coregister(
+                scan.path, out, t1_nifti=t1.path, template_nifti=template, transform=transform
+            )
+        outputs[scan.modality] = out
+    return outputs
 
 
 @dataclass
