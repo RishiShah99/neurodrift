@@ -1,0 +1,23 @@
+# Lifespan flow backbone — v0 Phase 2 (MM-DiT-style flow-matching velocity model).
+# Operates on the FROZEN DisentangledVAE3D latents (z = 16ch x 32^3 at 128^3 input).
+# Conditioned on continuous AGE (the only real v0 signal); the categoricals are wired
+# CFG-droppable slots trained on their reserved NULL index 0 (no reliable labels at
+# v0) so the same checkpoint can be conditioned on them later. ~300M params at these
+# defaults. Tests override every dim to tiny.
+_target_: neurodrift.models.flow.MMDiT3D
+
+latent_channels: 16
+latent_size: 32
+patch_size: 2
+hidden: 768
+depth: 12
+heads: 12
+num_register_tokens: 4
+# Number of REAL classes per categorical (the embedding reserves +1 for NULL index 0).
+cardinalities:
+  sex: 2
+  dx: 4
+  apoe: 6
+  treatment: 6
+  cohort: 8
+cfg_dropout_p: 0.1
