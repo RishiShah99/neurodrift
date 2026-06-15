@@ -96,6 +96,22 @@ def main(cfg: DictConfig) -> None:
     if logger is not False:
         callbacks.insert(0, L.pytorch.callbacks.LearningRateMonitor(logging_interval="step"))
 
+    # Patience: stop once `monitor` stops improving so a converged run doesn't burn GPU to
+    # max_epochs. A graceful early stop exits train.py 0, so cook_and_finalize's && chain
+    # still runs eval+archive+poweroff. Opt out with early_stopping.enabled=false.
+    es_cfg = OmegaConf.to_container(cfg.get("early_stopping", {}), resolve=True) or {}
+    if es_cfg.get("enabled", False) and not bool(cfg.trainer.get("fast_dev_run", False)):
+        callbacks.append(
+            L.pytorch.callbacks.EarlyStopping(
+                monitor=es_cfg.get("monitor", "val/loss"),
+                mode=es_cfg.get("mode", "min"),
+                patience=int(es_cfg.get("patience", 8)),
+                min_delta=float(es_cfg.get("min_delta", 1.0e-3)),
+                strict=bool(es_cfg.get("strict", False)),
+                verbose=True,
+            )
+        )
+
     trainer: L.Trainer = instantiate(cfg.trainer, callbacks=callbacks, logger=logger)
 
     fast_dev_run = bool(cfg.trainer.get("fast_dev_run", False))

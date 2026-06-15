@@ -23,6 +23,20 @@ eval:
   max_batches: null   # cap val batches for a quick smoke; null = full val set
   cross_modal: true   # also compute the T1->T2-style synthesis matrix
 
+# Early stopping (patience). When enabled, training halts once `monitor` stops improving
+# by `min_delta` for `patience` validation checks, so a converged run exits cleanly and
+# scripts/cook_and_finalize.sh proceeds to eval+archive instead of burning GPU to
+# max_epochs. `patience` is in VAL CHECKS (trainer.val_check_interval=0.25 -> 4/epoch, so
+# patience 8 ~= 2 epochs). min_delta ignores sub-1e-3 noise wiggles. strict=false so it
+# no-ops (rather than erroring) on experiments that don't log `monitor`.
+early_stopping:
+  enabled: true
+  monitor: val/loss
+  mode: min
+  patience: 8
+  min_delta: 1.0e-3
+  strict: false
+
 hydra:
   run:
     dir: ${output_dir}
