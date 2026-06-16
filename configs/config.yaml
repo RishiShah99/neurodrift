@@ -16,12 +16,26 @@ ckpt_path: last
 # Local TensorBoard logging. Set false for unit-test fast_dev_run.
 log_to_tensorboard: true
 
-# Single-process eval (scripts/eval.py). Canonical v0 metrics; the live DDP
-# epoch metrics are per-rank-local and not trustworthy for the post.
+# Single-process eval. Canonical v0 metrics; the live DDP epoch metrics are
+# per-rank-local and not trustworthy for the post. Shared by scripts/eval.py (VAE,
+# the first three keys) and scripts/flow_eval.py (flow, the keys below).
 eval:
   ckpt: null          # path to a Lightning or bare state-dict checkpoint
-  max_batches: null   # cap val batches for a quick smoke; null = full val set
-  cross_modal: true   # also compute the T1->T2-style synthesis matrix
+  max_batches: null   # [VAE] cap val batches for a quick smoke; null = full val set
+  cross_modal: true   # [VAE] also compute the T1->T2-style synthesis matrix
+  # --- flow_eval.py knobs (the lifespan-flow verdict) ---
+  vae_ckpt: null      # coreg VAE ckpt -> enables decoded-voxel proxies (else latent-only)
+  vae_config: null    # override the VAE geometry yaml (defaults to vae3d_disentangled.yaml)
+  use_ema: true       # load the EMA weights (canonical flow sampling target)
+  split: val          # which latent split to use as the held-out real reference
+  num_steps: 50       # Euler integration steps per sample
+  seed: 1234          # base RNG seed (fixed across the age sweep = one identity)
+  max_real: 256       # cap on real latents loaded for the reference population
+  n_sweep: 10         # ages in the fixed-identity age-trajectory sweep
+  n_bins: 4           # equal-count age bins for population-mean MAE
+  pop_n: 32           # samples per bin for the population mean
+  cov_n: 32           # samples for the 90% envelope-coverage estimate
+  decode_chunk: 2     # latents decoded per VAE forward (caps decode memory)
 
 # Early stopping (patience). When enabled, training halts once `monitor` stops improving
 # by `min_delta` for `patience` validation checks, so a converged run exits cleanly and
