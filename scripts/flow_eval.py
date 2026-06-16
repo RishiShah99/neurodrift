@@ -129,8 +129,14 @@ def _quantile_bins(ages: torch.Tensor, k: int) -> list[tuple[float, float, torch
     return bins
 
 
+@torch.no_grad()
 def _decode_t1(vae: torch.nn.Module, z: torch.Tensor, chunk: int) -> torch.Tensor:
-    """Decode latents to the T1 (slot 0) volume in chunks; returns (B, D, H, W)."""
+    """Decode latents to the T1 (slot 0) volume in chunks; returns (B, D, H, W).
+
+    no_grad is essential: without it every chunk's decode graph is retained (the
+    returned tensors keep referencing it), so a few hundred 128^3 decodes pile up
+    into hundreds of GB and OOM even a B200. Eval needs no gradients anyway.
+    """
     outs: list[torch.Tensor] = []
     for s in range(0, z.shape[0], chunk):
         recon = vae.decode(z[s : s + chunk])  # (b, M, D, H, W)
@@ -181,7 +187,9 @@ def main(cfg: DictConfig) -> None:
     vae: torch.nn.Module | None = None
     vae_ckpt = eval_cfg.get("vae_ckpt")
     if vae_ckpt:
-        vae_cfg_path = Path(eval_cfg.get("vae_config", _DEFAULT_VAE_CONFIG))
+        # `or` (not .get's default): the config key exists set to null, so .get
+        # returns None — fall back to the bundled VAE geometry in that case.
+        vae_cfg_path = Path(eval_cfg.get("vae_config") or _DEFAULT_VAE_CONFIG)
         vae = instantiate(OmegaConf.load(vae_cfg_path)).to(device).eval()
         _load_vae_weights(vae, Path(vae_ckpt))
         log.info("decoded-voxel proxies ON (vae=%s)", vae_ckpt)
