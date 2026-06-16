@@ -292,6 +292,37 @@ def test_tokens_reshape_is_per_voxel() -> None:
     assert torch.allclose(tokens[0], z[0, :, 0, 0, 0])
 
 
+def test_sample_tokens_caps_count() -> None:
+    """Over-budget batches are subsampled to max_tokens; under-budget pass through."""
+    lit = _make_lit()
+    lit.max_tokens = 100
+    z = torch.randn(2, D_IN, 4, 4, 4)  # 2 * 4^3 = 128 tokens > 100
+    capped = lit._sample_tokens(z)
+    assert capped.shape == (100, D_IN)
+    # Under budget: returns every token unchanged.
+    small = torch.randn(1, D_IN, 4, 4, 4)  # 64 tokens <= 100
+    assert lit._sample_tokens(small).shape == (64, D_IN)
+
+
+def test_sample_tokens_none_disables_cap() -> None:
+    lit = _make_lit()
+    lit.max_tokens = None
+    z = torch.randn(3, D_IN, 4, 4, 4)
+    assert lit._sample_tokens(z).shape == (3 * 4 * 4 * 4, D_IN)
+
+
+def test_sampled_tokens_are_real_voxel_tokens() -> None:
+    """Every subsampled row is one of the latent's actual per-voxel C-vectors."""
+    lit = _make_lit()
+    lit.max_tokens = 10
+    z = torch.randn(2, D_IN, 4, 4, 4)
+    full = _tokens(z)
+    capped = lit._sample_tokens(z)
+    # Each returned token must exactly match some row of the full token set.
+    for row in capped:
+        assert torch.isclose(full, row, atol=1e-6).all(dim=1).any()
+
+
 def test_fast_dev_run_trains() -> None:
     """Full Lightning step through configure_optimizers + training/validation_step.
 
@@ -315,3 +346,23 @@ def test_fast_dev_run_trains() -> None:
     assert torch.isfinite(loss)
     l0 = (out.acts != 0).sum(dim=1)
     assert torch.equal(l0, torch.full_like(l0, K))
+
+
+def test_fast_dev_run_with_token_cap() -> None:
+    """The capped path (subsampled step + subsampled dead-tracker) trains cleanly.
+
+    Sets max_tokens BELOW the synthetic batch's token count so both _step and
+    on_train_batch_end exercise the subsample branch — the exact OOM-fix path."""
+    lit = _make_lit()
+    lit.max_tokens = 16  # 2 latents * 4^3 = 128 tokens per batch -> capped to 16
+    loader = DataLoader(_SyntheticLatents(), batch_size=2, collate_fn=_collate)
+    trainer = L.Trainer(
+        fast_dev_run=True,
+        accelerator="cpu",
+        devices=1,
+        enable_checkpointing=False,
+        logger=False,
+        enable_progress_bar=False,
+    )
+    trainer.fit(lit, train_dataloaders=loader, val_dataloaders=loader)
+    assert trainer.global_step >= 1

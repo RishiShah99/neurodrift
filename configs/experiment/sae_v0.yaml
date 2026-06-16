@@ -19,6 +19,12 @@ litmodule:
   # Extra LitModule-level weight on the model's already-scaled AuxK loss. 1.0 keeps
   # the model's aux_coef the single knob; raise it only if dead_frac stays high.
   aux_coef: 1.0
+  # Per-step token cap. The SAE pre-acts are (N_tokens, d_hidden=8192); at d^3=32768
+  # voxels/latent the FULL batch is 262k tokens (~8.6 GB), which OOM'd the L4. Each
+  # voxel is an i.i.d. token, so we train on a 32768-token random subset per step —
+  # one latent's worth of voxels, plenty for the dictionary, fixed memory regardless
+  # of data.batch_size. Raise on a bigger GPU; lower if a 22 GB card still OOMs.
+  max_tokens: 32768
 
 optimizer:
   _target_: torch.optim.AdamW
