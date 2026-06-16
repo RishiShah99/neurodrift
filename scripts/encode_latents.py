@@ -60,24 +60,49 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
-def _existing_latent_stems(bucket: str, cohort: str, latent_prefix: str) -> set[str]:
-    """Stems of every `<stem>.zarr` already under the latent prefix for a cohort.
+def _existing_latent_stems(latent_root: str, cohort: str) -> set[str]:
+    """Stems of every `<stem>.zarr` already under `<latent_root>/<cohort>/`.
 
-    One listing instead of one-ls-per-subject (mirrors
-    preprocess._existing_zarr_stems). Stems are `sub-X[_ses-Y]` (no modality).
+    fsspec-based so it works for a LOCAL latent root and `gs://` alike (mirrors
+    latents.list_latent_refs / data_module._list_zarr_stems). One listing, not one
+    ls-per-subject. Stems are `sub-X[_ses-Y]` (no modality). Absent dir -> empty
+    set (nothing cached yet).
     """
-    prefix = f"gs://{bucket}/{latent_prefix}/{cohort}/"
-    res = subprocess.run(
-        ["gcloud", "storage", "ls", prefix], capture_output=True, text=True, check=False
-    )
-    if res.returncode != 0:
+    import fsspec
+
+    base = f"{latent_root.rstrip('/')}/{cohort}"
+    fs, base_path = fsspec.core.url_to_fs(base)
+    try:
+        entries = fs.ls(base_path, detail=False)
+    except FileNotFoundError:
         return set()
     stems: set[str] = set()
-    for line in res.stdout.splitlines():
-        name = line.rstrip("/").rsplit("/", 1)[-1]
+    for entry in entries:
+        name = entry.rstrip("/").rsplit("/", 1)[-1]
         if name.endswith(".zarr"):
             stems.add(name[: -len(".zarr")])
     return stems
+
+
+def _load_local_participants(participants_dir: str, cohort: str) -> dict[str, float]:
+    """Read a locally-staged `<cohort>_participants.tsv` -> {sub-XXX: age}.
+
+    The age-recovery path (scripts/build_age_map.py) consolidates each cohort's
+    BIDS participants.tsv into `<participants_dir>/<cohort>_participants.tsv`. Falls
+    back through a couple of common layouts; absent -> {} (all ages NaN).
+    """
+    d = Path(participants_dir)
+    for cand in (
+        d / f"{cohort}_participants.tsv",
+        d / cohort / "participants.tsv",
+        d / f"{cohort}.tsv",
+    ):
+        if cand.exists():
+            ages = parse_participants_tsv(cand)
+            log.info("%s: local participants %s -> %d subject ages", cohort, cand.name, len(ages))
+            return ages
+    log.warning("%s: no local participants.tsv under %s -> all ages NaN", cohort, participants_dir)
+    return {}
 
 
 def _download_participants_tsv(bucket: str, cohort: str, dest: Path) -> dict[str, float]:
@@ -185,23 +210,44 @@ def _encode_cohort(
     cohort: str,
     scratch: Path,
 ) -> tuple[int, int]:
-    log.info("=== %s: enumerate corpus + read participants.tsv ===", cohort)
-    ages = _download_participants_tsv(args.bucket, cohort, scratch)
+    log.info("=== %s: enumerate corpus + resolve ages ===", cohort)
+    # Age source: a locally-staged consolidated participants.tsv (the recovery
+    # path) wins; else fall back to the per-cohort GCS raw participants.tsv.
+    if args.participants_dir:
+        ages = _load_local_participants(args.participants_dir, cohort)
+    else:
+        ages = _download_participants_tsv(args.bucket, cohort, scratch)
 
-    zarr_root = f"gs://{args.bucket}/{args.zarr_prefix}"
+    # Corpus + latent roots: a full --zarr-root / --latent-root (local path or
+    # gs://) overrides the gs://{bucket}/{prefix} construction. This lets the
+    # encoder read the coreg corpus straight off the box's local disk (the full
+    # 7.8k stores never finished the slow cross-region upload) and write latents
+    # locally for on-box training, with no GCS round-trip.
+    zarr_root = args.zarr_root or f"gs://{args.bucket}/{args.zarr_prefix}"
+    latent_root = args.latent_root or f"gs://{args.bucket}/{args.latent_prefix}"
+    remote_out = latent_root.startswith("gs://")
+
     refs = _list_zarr_stems(zarr_root, cohort)
     groups = _group_by_subject(refs)
     groups.sort(key=lambda g: (g.cohort, g.subject, g.session or ""))
-    log.info("%s: %d subject-session groups (%d scans)", cohort, len(groups), len(refs))
-
-    cached = (
-        set() if args.force else _existing_latent_stems(args.bucket, cohort, args.latent_prefix)
+    n_aged = sum(1 for g in groups if not np.isnan(ages.get(g.subject, float("nan"))))
+    log.info(
+        "%s: %d subject-session groups (%d scans); %d/%d have a real age",
+        cohort,
+        len(groups),
+        len(refs),
+        n_aged,
+        len(groups),
     )
+
+    cached = set() if args.force else _existing_latent_stems(latent_root, cohort)
     todo = [g for g in groups if _stem_for_group(g) not in cached]
     log.info("%s: %d groups to encode (%d cached)", cohort, len(todo), len(groups) - len(todo))
 
     modalities = model.modalities
-    out_dir = scratch / "latents" / cohort
+    # Local root -> write each store straight to its final home (no upload). Remote
+    # root -> stage under scratch then gcloud cp.
+    out_dir = (scratch / "latents" / cohort) if remote_out else (Path(latent_root) / cohort)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     n_ok = 0
@@ -227,7 +273,8 @@ def _encode_cohort(
                 subject=group.subject,
                 session=group.session or "",
             )
-            _upload_latent(args.bucket, cohort, store_path, args.latent_prefix)
+            if remote_out:
+                _upload_latent(latent_root, cohort, store_path)
             n_ok += 1
         except Exception:
             log.exception("%s: %s failed", cohort, stem)
@@ -236,11 +283,11 @@ def _encode_cohort(
     return n_ok, n_fail
 
 
-def _upload_latent(bucket: str, cohort: str, store: Path, latent_prefix: str) -> None:
+def _upload_latent(latent_root: str, cohort: str, store: Path) -> None:
     # Copy the store INTO the cohort prefix (mirrors preprocess._upload_zarr): name
-    # the destination `<latent_prefix>/<cohort>/` so gcloud appends the basename
-    # once -> `<cohort>/<stem>.zarr/...`.
-    dst = f"gs://{bucket}/{latent_prefix}/{cohort}/"
+    # the destination `<latent_root>/<cohort>/` with a trailing slash so gcloud
+    # appends the basename once -> `<cohort>/<stem>.zarr/...`. gs:// roots only.
+    dst = f"{latent_root.rstrip('/')}/{cohort}/"
     _run(["gcloud", "storage", "cp", "--recursive", str(store), dst])
 
 
@@ -254,6 +301,23 @@ def main() -> int:
         "--zarr-prefix", default="zarr", help="Source corpus root under the bucket."
     )
     parser.add_argument("--latent-prefix", default="latents", help="Latent store root.")
+    parser.add_argument(
+        "--zarr-root",
+        default="",
+        help="Full corpus root (local path or gs://...). Overrides --bucket/--zarr-prefix; "
+        "lets the encoder read the coreg corpus off the box's local disk.",
+    )
+    parser.add_argument(
+        "--latent-root",
+        default="",
+        help="Full latent output root (local path or gs://...). Overrides "
+        "--bucket/--latent-prefix; a local root writes in place and skips GCS upload.",
+    )
+    parser.add_argument(
+        "--participants-dir",
+        default="",
+        help="Local dir with <cohort>_participants.tsv for age wiring (else GCS raw).",
+    )
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--force", action="store_true")

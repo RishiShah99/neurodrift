@@ -272,3 +272,109 @@ def test_datamodule_empty_root_raises(tmp_path: Path) -> None:
     dm = LatentDataModule(latent_root=str(tmp_path), cohorts=["abide"], num_workers=0)
     with pytest.raises(RuntimeError, match="encode_latents"):
         dm.setup()
+
+
+# ---------------------------------------------------------------------------
+# encode_latents.py — local corpus -> local latents + local age wiring
+# ---------------------------------------------------------------------------
+def _write_voxel_store(path: Path, vol: np.ndarray) -> None:
+    """Write a (D,H,W) voxel zarr store with a `data` array (the corpus schema)."""
+    import zarr
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    root = zarr.open(str(path), mode="w")
+    data = root.create_dataset(
+        "data", shape=vol.shape, chunks=vol.shape, dtype=np.float32, overwrite=True
+    )
+    data[...] = vol.astype(np.float32)
+
+
+def test_encode_latents_local_end_to_end(tmp_path: Path) -> None:
+    """The local path: --zarr-root + --latent-root + --participants-dir, no GCS.
+
+    Drives the real CLI over a tiny voxel corpus through a tiny frozen VAE, and
+    checks each subject-session latent lands locally with the recovered age (and
+    NaN where the TSV has none). Idempotent re-run must encode nothing new.
+    """
+    import subprocess
+    import sys
+
+    rs = np.random.RandomState(0)
+    # Tiny frozen VAE -> bare state-dict ckpt (geometry must match the CLI overrides).
+    model = DisentangledVAE3D(
+        modalities=MODS,
+        latent_channels=4,
+        style_dim=8,
+        base_channels=8,
+        channel_mults=(1, 2, 4),
+        num_res_blocks=1,
+    )
+    ckpt = tmp_path / "vae.ckpt"
+    torch.save(model.state_dict(), ckpt)
+
+    # Voxel corpus: sub-001 (T1+T2, no session), sub-002 (T1, ses-01), sub-003 (T1, no age).
+    corpus = tmp_path / "corpus"
+    for stem in ("sub-001_T1w", "sub-001_T2w", "sub-002_ses-01_T1w", "sub-003_T1w"):
+        _write_voxel_store(corpus / "openneuro" / f"{stem}.zarr", rs.randn(16, 16, 16))
+
+    # Recovered ages: sub-001 + sub-002 present, sub-003 absent -> NaN downstream.
+    pdir = tmp_path / "participants"
+    pdir.mkdir()
+    (pdir / "openneuro_participants.tsv").write_text(
+        "participant_id\tage\nsub-001\t30.0\nsub-002\t55.0\n", encoding="utf-8"
+    )
+
+    latents = tmp_path / "latents"
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    cmd = [
+        sys.executable,
+        str(Path("scripts/encode_latents.py").resolve()),
+        "--cohorts",
+        "openneuro",
+        "--ckpt",
+        str(ckpt),
+        "--zarr-root",
+        str(corpus),
+        "--latent-root",
+        str(latents),
+        "--participants-dir",
+        str(pdir),
+        "--device",
+        "cpu",
+        "--scratch",
+        str(scratch),
+        "--image-size",
+        "16",
+        "--latent-channels",
+        "4",
+        "--style-dim",
+        "8",
+        "--base-channels",
+        "8",
+        "--channel-mults",
+        "1,2,4",
+        "--num-res-blocks",
+        "1",
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+
+    # Three subject-session latents, no GCS upload, correct shape + age wiring.
+    out = latents / "openneuro"
+    stems = {p.name[: -len(".zarr")] for p in out.glob("*.zarr")}
+    assert stems == {"sub-001", "sub-002_ses-01", "sub-003"}, stems
+
+    by_stem = {s: read_latent_store(out / f"{s}.zarr") for s in stems}
+    for s, loaded in by_stem.items():
+        assert loaded is not None, s
+        z, _ = loaded
+        assert z.shape == (4, 4, 4, 4), (s, z.shape)
+    assert by_stem["sub-001"][1]["age"] == pytest.approx(30.0)
+    assert by_stem["sub-002_ses-01"][1]["age"] == pytest.approx(55.0)
+    assert math.isnan(by_stem["sub-003"][1]["age"]), "missing age -> NaN in the store"
+
+    # Idempotent: a second run finds all three cached and encodes nothing new.
+    res2 = subprocess.run(cmd, capture_output=True, text=True)
+    assert res2.returncode == 0, res2.stderr
+    assert "0 groups to encode (3 cached)" in (res2.stderr + res2.stdout)
