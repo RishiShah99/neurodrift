@@ -55,7 +55,9 @@ def check(experiment: str) -> None:
     print(f"  model         = {type(model).__name__}  ({n_params / 1e6:.1f}M params)")
     print(f"  litmodule     = {type(lit).__name__}")
     print(f"  data          = {type(data).__name__}  cohorts={list(cfg.data.cohorts)}")
-    print(f"  modalities    = {list(modalities) if modalities is not None else '— (latent-space model)'}")
+    print(
+        f"  modalities    = {list(modalities) if modalities is not None else '— (latent-space model)'}"
+    )
     print(
         f"  trainer       = devices={cfg.trainer.devices} strategy={cfg.trainer.get('strategy')} "
         f"precision={cfg.trainer.precision} grad_clip={cfg.trainer.get('gradient_clip_val', 'unset')}"

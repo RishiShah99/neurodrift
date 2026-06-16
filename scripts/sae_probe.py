@@ -270,7 +270,7 @@ def _latents_from_root(
             zs.append(t)
             age = attrs.get("age")
             try:
-                ages.append(float(age))
+                ages.append(float(age))  # type: ignore[arg-type]  # None/str guarded below
             except (TypeError, ValueError):
                 ages.append(float("nan"))
             subjects.append(str(attrs.get("subject", ref.subject)))
