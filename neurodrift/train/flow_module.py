@@ -15,10 +15,11 @@ step count and a NaN step is skipped identically on every rank.
 from __future__ import annotations
 
 import copy
-from typing import Any
+from typing import Any, cast
 
 import lightning as L
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from neurodrift.models.flow import (
@@ -79,12 +80,26 @@ class FlowLitModule(L.LightningModule):
         if age is None:
             age = torch.zeros(b, device=z.device)
         cond: dict[str, torch.Tensor] = {"age": age.to(z.device).float()}
+        cat_embed = self.model.cond_embed.cat_embed
         for field in CATEGORICAL_FIELDS:
             val = batch.get(field)
-            if val is None:
+            # Only TENSOR-valued slots are usable ids. The latent store emits `cohort`
+            # as a list[str] (and may omit labelled fields entirely), so any non-tensor
+            # slot trains the reserved NULL index 0 — the v0 contract (age is the only
+            # real signal; categoricals are CFG-droppable NULL slots for now).
+            if not isinstance(val, torch.Tensor):
                 cond[field] = torch.zeros(b, dtype=torch.long, device=z.device)
+                continue
+            ids = val.to(z.device).long()
+            # The store marks "unknown" with -1 (sex/dx/apoe) / 0 (treatment); the
+            # embedding reserves row 0 as NULL with real classes above it. Clamp into
+            # [0, cardinality] so an unknown sentinel maps to NULL instead of indexing
+            # the wrong (or last) embedding row, and no id can fall out of range.
+            if field in cat_embed:
+                ids = ids.clamp(0, cast(nn.Embedding, cat_embed[field]).num_embeddings - 1)
             else:
-                cond[field] = val.to(z.device).long()
+                ids = ids.clamp_min(0)
+            cond[field] = ids
         return cond
 
     def _step(self, batch: dict[str, Any], stage: str) -> torch.Tensor:
