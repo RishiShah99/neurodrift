@@ -219,6 +219,9 @@ def main(cfg: DictConfig) -> None:
         "latent_energy": lat_energy.tolist(),
         "latent_energy_vs_age_r": fe.pearson_r(lat_energy, sweep_ages),
         "latent_energy_smoothness": fe.trajectory_smoothness(lat_energy),
+        # Channel-resolved: the pooled r above averages all 16 content channels, so a
+        # strong signal in a few channels hides among the flat ones. This reads each.
+        "per_channel_age_r": fe.per_channel_age_correlation(swept.cpu(), sweep_ages),
     }
     if vae is not None:
         t1 = _decode_t1(vae, swept, decode_chunk)
@@ -229,6 +232,16 @@ def main(cfg: DictConfig) -> None:
         sweep_metrics["tissue_vs_age_r"] = fe.pearson_r(fg, sweep_ages)
         sweep_metrics["ventricle_vs_age_r"] = fe.pearson_r(dark, sweep_ages)
         sweep_metrics["ventricle_smoothness"] = fe.trajectory_smoothness(dark)
+        # Regional (sharper than the gross whole-volume fractions above): tight central
+        # cube for deep ventricular CSF, peripheral shell for cortical thinning.
+        slab = fe.central_slab_ventricle_fraction(t1)
+        rim = fe.cortical_rim_fraction(t1)
+        sweep_metrics["central_ventricle_proxy"] = slab.tolist()
+        sweep_metrics["cortical_rim_proxy"] = rim.tolist()
+        sweep_metrics["central_ventricle_vs_age_r"] = fe.pearson_r(slab, sweep_ages)
+        sweep_metrics["cortical_rim_vs_age_r"] = fe.pearson_r(rim, sweep_ages)
+        sweep_metrics["central_ventricle_smoothness"] = fe.trajectory_smoothness(slab)
+        sweep_metrics["cortical_rim_smoothness"] = fe.trajectory_smoothness(rim)
     metrics["age_sweep"] = sweep_metrics
 
     # === 2. population-mean MAE per age bin ===
@@ -307,11 +320,25 @@ def main(cfg: DictConfig) -> None:
         sweep_metrics["latent_energy_vs_age_r"],
         sweep_metrics["latent_energy_smoothness"]["max_jump_frac"],
     )
+    pcr = sweep_metrics["per_channel_age_r"]
+    log.info(
+        "  per-channel age r: strongest |r|=%.3f (ch %d), %d/%d channels |r|>0.6",
+        pcr["max_abs_r"],
+        pcr["argmax_channel"],
+        pcr["n_strong"],
+        pcr["n_channels"],
+    )
     if vae is not None:
         log.info(
             "  ventricle proxy vs age r: %+.3f (expect > 0)  tissue vs age r: %+.3f (expect < 0)",
             sweep_metrics["ventricle_vs_age_r"],
             sweep_metrics["tissue_vs_age_r"],
+        )
+        log.info(
+            "  [regional] central-ventricle vs age r: %+.3f (expect > 0)  "
+            "cortical-rim vs age r: %+.3f (expect < 0)",
+            sweep_metrics["central_ventricle_vs_age_r"],
+            sweep_metrics["cortical_rim_vs_age_r"],
         )
     if "envelope_coverage" in metrics:
         ec = metrics["envelope_coverage"]

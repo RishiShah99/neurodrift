@@ -147,6 +147,58 @@ def pearson_r(x: torch.Tensor, y: torch.Tensor) -> float:
     return float((xc @ yc) / denom)
 
 
+def per_channel_age_correlation(
+    swept: torch.Tensor, ages: Sequence[float] | torch.Tensor
+) -> dict[str, Any]:
+    """Per-latent-channel energy-vs-age correlation across an age sweep.
+
+    `swept` is the fixed-identity age sweep — (A, C, *spatial) from `age_sweep_latents`.
+    For each channel we take its mean |activation| over the spatial dims at each age
+    (an (A,) energy curve), then Pearson-correlate it with age. The pooled
+    `latent_energy_vs_age_r` (one number over ALL channels) washes out a strong signal
+    carried by a few channels against many flat ones; this resolves it per channel.
+
+    Returns:
+      * `per_channel_r`  — list length C, Pearson r of each channel's energy vs age,
+      * `max_abs_r`      — strongest channel |r| (the real age-signal strength),
+      * `argmax_channel` — which channel carries it,
+      * `mean_abs_r`     — mean |r| over channels (how broadly age is encoded),
+      * `n_strong`       — channels with |r| > 0.6 (a sharper read than the blunt mean),
+      * `n_channels`     — C.
+    NaN channels (constant energy) are dropped from the summaries, never counted strong.
+    """
+    a = torch.as_tensor(ages, dtype=torch.float32).flatten()
+    if swept.dim() == 2:
+        energy = swept.abs().float()  # already (A, C)
+    elif swept.dim() >= 3:
+        energy = swept.abs().float().flatten(2).mean(dim=2)  # (A, C)
+    else:
+        raise ValueError(f"swept must be (A, C) or (A, C, *spatial), got {tuple(swept.shape)}")
+    if energy.shape[0] != a.numel():
+        raise ValueError(f"age count {a.numel()} != sweep length {energy.shape[0]}")
+    c = energy.shape[1]
+    per_channel = [pearson_r(energy[:, j], a) for j in range(c)]
+    r_t = torch.tensor(per_channel, dtype=torch.float32)
+    finite = torch.isfinite(r_t)
+    abs_r = r_t.abs()
+    if bool(finite.any()):
+        masked = abs_r.masked_fill(~finite, -1.0)
+        argmax = int(masked.argmax())
+        max_abs_r = float(abs_r[finite].max())
+        mean_abs_r = float(abs_r[finite].mean())
+        n_strong = int((abs_r[finite] > 0.6).sum())
+    else:
+        argmax, max_abs_r, mean_abs_r, n_strong = -1, float("nan"), float("nan"), 0
+    return {
+        "per_channel_r": per_channel,
+        "max_abs_r": max_abs_r,
+        "argmax_channel": argmax,
+        "mean_abs_r": mean_abs_r,
+        "n_strong": n_strong,
+        "n_channels": c,
+    }
+
+
 def population_mean_mae(pred_mean: torch.Tensor, real_mean: torch.Tensor) -> dict[str, float]:
     """MAE between a predicted and a real population-mean tensor (same shape).
 
@@ -278,3 +330,66 @@ def dark_core_fraction(
     crop = v[:, _slice(d), _slice(h), _slice(w)]
     peak = v.reshape(b, -1).max(dim=1).values.clamp_min(1e-8).view(b, 1, 1, 1)
     return (crop < dark_thresh * peak).float().reshape(b, -1).mean(dim=1)
+
+
+def _central_cube_mask(d: int, h: int, w: int, frac: float, device: torch.device) -> torch.Tensor:
+    """Boolean (D,H,W) mask: the central `frac` of each spatial axis (a centered cube).
+
+    `frac` in (0, 1]; 1.0 selects the whole volume, 0.3 the central 30% per axis.
+    Shared by the regional proxies so their crop geometry is defined in one place.
+    """
+
+    def _ax(n: int) -> torch.Tensor:
+        lo = round(n * (1.0 - frac) / 2.0)
+        hi = max(n - lo, lo + 1)
+        m = torch.zeros(n, dtype=torch.bool, device=device)
+        m[lo:hi] = True
+        return m
+
+    md, mh, mw = _ax(d), _ax(h), _ax(w)
+    return md[:, None, None] & mh[None, :, None] & mw[None, None, :]
+
+
+def central_slab_ventricle_fraction(
+    vol: torch.Tensor, *, core: float = 0.3, dark_thresh: float = 0.15
+) -> torch.Tensor:
+    """Sharper ventricle proxy: dark-voxel fraction in a TIGHT central cube.
+
+    The lateral/third-ventricle bodies are deep and central; the blunt
+    `dark_core_fraction` (core=0.5) also sweeps in peripheral sulcal CSF that dilutes
+    the trajectory. Cropping a tighter central cube (default 30% per axis vs 50%)
+    isolates the deep periventricular CSF, so the dark fraction tracks ventricular
+    enlargement more specifically. Threshold is relative to each volume's max
+    (scale-robust). Expected to RISE with age. Returns (B,).
+    """
+    v = _as_batched(vol).float()
+    b, d, h, w = v.shape
+    mask = _central_cube_mask(d, h, w, core, v.device).reshape(1, -1)
+    peak = v.reshape(b, -1).max(dim=1, keepdim=True).values.clamp_min(1e-8)
+    dark = (v.reshape(b, -1) < dark_thresh * peak) & mask
+    return dark.float().sum(dim=1) / mask.float().sum().clamp_min(1.0)
+
+
+def cortical_rim_fraction(
+    vol: torch.Tensor, *, inner: float = 0.5, outer: float = 0.9, thresh: float = 0.1
+) -> torch.Tensor:
+    """Cortical-thinning proxy: bright-tissue fraction in the peripheral brain shell.
+
+    The cortical ribbon sits at the brain's outer surface, not its core (deep WM /
+    ventricles) nor the cube corners (background on an MNI-registered, skull-stripped
+    volume). We measure the foreground fraction in the SHELL between the central
+    `inner` cube and the `outer` cube — peripheral tissue that recedes as cortex thins
+    and the brain atrophies. Threshold is relative to each volume's max (scale-robust).
+    Expected to FALL with age. Returns (B,).
+    """
+    if not 0.0 < inner < outer <= 1.0:
+        raise ValueError(f"need 0 < inner < outer <= 1, got inner={inner} outer={outer}")
+    v = _as_batched(vol).float()
+    b, d, h, w = v.shape
+    shell = _central_cube_mask(d, h, w, outer, v.device) & ~_central_cube_mask(
+        d, h, w, inner, v.device
+    )
+    shell_flat = shell.reshape(1, -1)
+    peak = v.reshape(b, -1).max(dim=1, keepdim=True).values.clamp_min(1e-8)
+    bright = (v.reshape(b, -1) > thresh * peak) & shell_flat
+    return bright.float().sum(dim=1) / shell_flat.float().sum().clamp_min(1.0)

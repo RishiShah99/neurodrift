@@ -15,10 +15,13 @@ torch = pytest.importorskip("torch")
 from neurodrift.eval.flow_eval import (  # noqa: E402
     age_sweep_latents,
     build_cond,
+    central_slab_ventricle_fraction,
+    cortical_rim_fraction,
     dark_core_fraction,
     envelope_coverage,
     foreground_fraction,
     pearson_r,
+    per_channel_age_correlation,
     population_mean_mae,
     sample_population,
     trajectory_smoothness,
@@ -169,6 +172,41 @@ def test_trajectory_smoothness_needs_two_points() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Channel-resolved age correlation
+# ---------------------------------------------------------------------------
+def test_per_channel_isolates_the_signal_channel() -> None:
+    # Channel 1's energy rises linearly with age; channels 0 and 2 stay flat.
+    a, c = 5, 3
+    swept = torch.ones(a, c, 2, 2, 2)
+    for age_i in range(a):
+        swept[age_i, 1] = float(age_i + 1)
+    out = per_channel_age_correlation(swept, [0.0, 1.0, 2.0, 3.0, 4.0])
+    assert out["n_channels"] == 3
+    assert out["argmax_channel"] == 1
+    assert pytest.approx(out["max_abs_r"], abs=1e-5) == 1.0
+    assert out["n_strong"] == 1  # only the one real channel; flat channels are NaN, dropped
+
+
+def test_per_channel_accepts_precomputed_energy_2d() -> None:
+    energy = torch.tensor([[1.0, 0.0], [2.0, 0.0], [3.0, 0.0]])  # ch0 rises, ch1 flat
+    out = per_channel_age_correlation(energy, [10.0, 20.0, 30.0])
+    assert out["argmax_channel"] == 0
+    assert pytest.approx(out["max_abs_r"], abs=1e-5) == 1.0
+
+
+def test_per_channel_all_flat_is_graceful() -> None:
+    out = per_channel_age_correlation(torch.ones(3, 2), [1.0, 2.0, 3.0])
+    assert out["argmax_channel"] == -1
+    assert out["n_strong"] == 0
+    assert torch.isnan(torch.tensor(out["max_abs_r"]))
+
+
+def test_per_channel_age_count_guard() -> None:
+    with pytest.raises(ValueError):
+        per_channel_age_correlation(torch.randn(4, 2), [1.0, 2.0])
+
+
+# ---------------------------------------------------------------------------
 # Decoded-volume proxies
 # ---------------------------------------------------------------------------
 def test_foreground_fraction_half_bright() -> None:
@@ -200,6 +238,42 @@ def test_dark_core_fraction_dark_vs_bright_center() -> None:
 def test_proxy_shape_guard() -> None:
     with pytest.raises(ValueError):
         foreground_fraction(torch.randn(2, 3))  # not 3- or 4-D
+
+
+# ---------------------------------------------------------------------------
+# Regional proxies (sharper than the gross whole-volume fractions)
+# ---------------------------------------------------------------------------
+def test_central_slab_localises_deep_csf_more_than_blunt_core() -> None:
+    # A tiny dark cube exactly at the deep center: the tight central crop reads it as a
+    # large fraction; the blunt core=0.5 crop dilutes it with surrounding bright tissue.
+    vol = torch.ones(1, 10, 10, 10)
+    vol[:, 4:6, 4:6, 4:6] = 0.0
+    fs = float(central_slab_ventricle_fraction(vol, core=0.3, dark_thresh=0.15)[0])
+    fd = float(dark_core_fraction(vol, core=0.5, dark_thresh=0.15)[0])
+    assert fs > fd  # sharper localisation of the deep dark region
+
+
+def test_central_slab_zero_when_no_dark() -> None:
+    assert float(central_slab_ventricle_fraction(torch.ones(1, 8, 8, 8))[0]) == 0.0
+
+
+def test_cortical_rim_falls_as_periphery_empties() -> None:
+    young = torch.ones(1, 12, 12, 12)  # tissue out to the periphery
+    old = torch.zeros(1, 12, 12, 12)
+    old[:, 4:8, 4:8, 4:8] = 1.0  # tissue only in the core; rim emptied (atrophy)
+    fy = float(cortical_rim_fraction(young)[0])
+    fo = float(cortical_rim_fraction(old)[0])
+    assert fy > fo
+    assert pytest.approx(fy, abs=1e-6) == 1.0  # bright everywhere -> full rim
+
+
+def test_cortical_rim_accepts_unbatched() -> None:
+    assert cortical_rim_fraction(torch.ones(8, 8, 8)).shape == (1,)
+
+
+def test_cortical_rim_inner_outer_guard() -> None:
+    with pytest.raises(ValueError):
+        cortical_rim_fraction(torch.ones(1, 8, 8, 8), inner=0.9, outer=0.5)
 
 
 # ---------------------------------------------------------------------------
