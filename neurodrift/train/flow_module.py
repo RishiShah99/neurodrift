@@ -30,6 +30,40 @@ from neurodrift.models.flow import (
 from neurodrift.train.lightning_module import _skip_step_if_nonfinite
 
 
+def build_cond_from_batch(model: MMDiT3D, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
+    """Assemble the COND dict from a batch, defaulting missing slots to NULL/0.
+
+    `age` is the only real v0 signal (NaN-safe handling lives in the embedder). Every
+    absent or non-tensor categorical defaults to a zeros (B,) long tensor — the
+    reserved NULL index — so a corpus with no labels trains the unconditional path.
+    The latent store emits `cohort` as a list[str] (and may omit labelled fields), so
+    any non-tensor slot trains NULL. Known ids are clamped into [0, cardinality] so an
+    "unknown" sentinel (-1) maps to NULL instead of indexing the wrong embedding row.
+
+    Shared by the flow trainer and the distillation trainer so the student is
+    conditioned through the byte-identical contract as the teacher.
+    """
+    z = batch["z"]
+    b = z.shape[0]
+    age = batch.get("age")
+    if age is None:
+        age = torch.zeros(b, device=z.device)
+    cond: dict[str, torch.Tensor] = {"age": age.to(z.device).float()}
+    cat_embed = model.cond_embed.cat_embed
+    for field in CATEGORICAL_FIELDS:
+        val = batch.get(field)
+        if not isinstance(val, torch.Tensor):
+            cond[field] = torch.zeros(b, dtype=torch.long, device=z.device)
+            continue
+        ids = val.to(z.device).long()
+        if field in cat_embed:
+            ids = ids.clamp(0, cast(nn.Embedding, cat_embed[field]).num_embeddings - 1)
+        else:
+            ids = ids.clamp_min(0)
+        cond[field] = ids
+    return cond
+
+
 class FlowLitModule(L.LightningModule):
     """Flow-matching trainer for the lifespan velocity model (automatic optimization)."""
 
@@ -68,39 +102,8 @@ class FlowLitModule(L.LightningModule):
         return velocity
 
     def _build_cond(self, batch: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Assemble the COND dict from a batch, defaulting missing slots to NULL/0.
-
-        `age` is the only real v0 signal (NaN-safe handling lives in the embedder).
-        Every absent categorical defaults to a zeros (B,) long tensor — the reserved
-        NULL index — so a corpus with no labels trains the unconditional path.
-        """
-        z = batch["z"]
-        b = z.shape[0]
-        age = batch.get("age")
-        if age is None:
-            age = torch.zeros(b, device=z.device)
-        cond: dict[str, torch.Tensor] = {"age": age.to(z.device).float()}
-        cat_embed = self.model.cond_embed.cat_embed
-        for field in CATEGORICAL_FIELDS:
-            val = batch.get(field)
-            # Only TENSOR-valued slots are usable ids. The latent store emits `cohort`
-            # as a list[str] (and may omit labelled fields entirely), so any non-tensor
-            # slot trains the reserved NULL index 0 — the v0 contract (age is the only
-            # real signal; categoricals are CFG-droppable NULL slots for now).
-            if not isinstance(val, torch.Tensor):
-                cond[field] = torch.zeros(b, dtype=torch.long, device=z.device)
-                continue
-            ids = val.to(z.device).long()
-            # The store marks "unknown" with -1 (sex/dx/apoe) / 0 (treatment); the
-            # embedding reserves row 0 as NULL with real classes above it. Clamp into
-            # [0, cardinality] so an unknown sentinel maps to NULL instead of indexing
-            # the wrong (or last) embedding row, and no id can fall out of range.
-            if field in cat_embed:
-                ids = ids.clamp(0, cast(nn.Embedding, cat_embed[field]).num_embeddings - 1)
-            else:
-                ids = ids.clamp_min(0)
-            cond[field] = ids
-        return cond
+        """Assemble the COND dict from a batch (see `build_cond_from_batch`)."""
+        return build_cond_from_batch(self.model, batch)
 
     def _step(self, batch: dict[str, Any], stage: str) -> torch.Tensor:
         x1 = batch["z"]
