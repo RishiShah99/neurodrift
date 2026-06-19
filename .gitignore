@@ -107,3 +107,8 @@ desktop.ini
 *.log
 tmp/
 scratch/
+
+# ---------- Scratch outputs (regenerable; never tracked) ----------
+out_eval_smoke/
+montage.png
+scripts/_*.py
